@@ -6,7 +6,7 @@ import {
   type NavmeFloorEditPayload,
   type NavmeFloorEditRow,
 } from './floorEditPayload';
-import type { Floor2DMap, FloorBlock } from '../floor2d';
+import type { Floor2DMap, FloorBlock, FloorLevel } from '../floor2d';
 
 function normMapCode(code: string): string {
   return code.trim().toUpperCase();
@@ -51,12 +51,13 @@ export async function saveNavmeFloorEdit(
   walk: Uint8Array,
   objects: FloorBlock[],
   zones: FloorBlock[],
+  floors: FloorLevel[],
 ): Promise<{ ok: boolean; error?: string }> {
   const sb = getSupabase();
   if (!sb) {
     return { ok: false, error: 'Supabase not configured (VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY)' };
   }
-  const payload = buildFloorEditPayload(map, walk, objects, zones, sliceY, normMapCode(mapCode));
+  const payload = buildFloorEditPayload(map, walk, objects, zones, floors, sliceY, normMapCode(mapCode));
   const row = {
     poi_type: normPoiType(poiType),
     map_code: normMapCode(mapCode),
@@ -72,7 +73,7 @@ export async function saveNavmeFloorEdit(
     return { ok: false, error: error.message };
   }
   console.log(
-    `[navmeFloorEdits] Saved ${payload.objects.length} object(s), ${payload.zones.length} zone(s) for ${row.poi_type} / ${row.map_code}`,
+    `[navmeFloorEdits] Saved ${payload.objects.length} object(s), ${payload.zones.length} zone(s), ${payload.floors.length} floor(s) for ${row.poi_type} / ${row.map_code}`,
   );
   return { ok: true };
 }

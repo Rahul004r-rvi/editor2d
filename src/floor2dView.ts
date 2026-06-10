@@ -1,8 +1,20 @@
 import type { NavMesh } from 'recast-navigation';
-import { parseZoneRouteId, type NavMapPoi } from './pois';
+import { parseFloorRouteId, parseZoneRouteId, type NavMapPoi } from './pois';
+import {
+  applyRegionEdit,
+  cloneRegionBlock,
+  hitRegionHandle,
+  hitTestRegion,
+  regionCentroid,
+  type RegionDrawMode,
+} from './labeledRegion';
 import { buildFloorEditPayload, type NavmeFloorEditPayload } from './data/floorEditPayload';
 import {
   applyWalkGridEdits,
+  cloneFloorLevels,
+  defaultFloorLabel,
+  floorLevelGridMatches,
+  floorLevelSliceMatches,
   FLOOR2D_STYLE,
   nextZoneStrokeColor,
   paintRectOnWalk,
@@ -10,18 +22,16 @@ import {
   zoneDisplayLabel,
   type Floor2DMap,
   type FloorBlock,
+  type FloorLevel,
   type FloorShape,
 } from './floor2d';
+import { findPathOnFloorGrid } from './floor2dRoute';
 import { extractNavMeshSlice2D, type NavMeshSliceTri } from './navmesh2d';
 import {
   boundsFromPoints,
-  cloneZonePoints,
   dist2,
   isPolygonZone,
-  pointInsideZone,
-  resizeRectZone,
   syncZoneBounds,
-  translateZone,
   zoneCentroid,
   type ZoneEditHandle,
   type ZonePoint,
@@ -32,7 +42,7 @@ export type Floor2DViewOptions = {
 };
 
 export type Floor2DTool = 'pan' | 'add' | 'cut' | 'object' | 'zone' | 'zone-edit';
-export type ZoneDrawMode = 'rectangle' | 'polygon';
+export type ZoneDrawMode = RegionDrawMode;
 
 type EditSnapshot = { walk: Uint8Array; objects: FloorBlock[]; zones: FloorBlock[] };
 
@@ -62,13 +72,6 @@ function cloneBlocks(blocks: FloorBlock[]): FloorBlock[] {
   }));
 }
 
-function cloneZoneBlock(block: FloorBlock): FloorBlock {
-  return {
-    ...block,
-    points: cloneZonePoints(block.points),
-  };
-}
-
 function truncateLabel(text: string, maxLen: number): string {
   return text.length > maxLen ? text.slice(0, maxLen - 1) + '…' : text;
 }
@@ -79,6 +82,8 @@ export class Floor2DView {
   private editWalk: Uint8Array | null = null;
   private editObjects: FloorBlock[] = [];
   private editZones: FloorBlock[] = [];
+  private editFloors: FloorLevel[] = [];
+  private activeFloorId: string | null = null;
   private objectShape: FloorShape = 'rectangle';
   private tool: Floor2DTool = 'pan';
   private dirty = false;
@@ -95,6 +100,7 @@ export class Floor2DView {
   private lastY = 0;
   private objectIdSeq = 0;
   private zoneIdSeq = 0;
+  private floorIdSeq = 0;
   private undoStack: EditSnapshot[] = [];
   private redoStack: EditSnapshot[] = [];
   private showNavMesh = false;
@@ -103,23 +109,26 @@ export class Floor2DView {
   private onDirtyChange?: (dirty: boolean) => void;
   private onHistoryChange?: (canUndo: boolean, canRedo: boolean) => void;
   private onZonesChange?: () => void;
+  private onFloorsChange?: () => void;
   private onRouteRebuild?: () => void;
+  private onZoneSelectionChange?: (zoneId: string | null) => void;
+  private onFloorActivate?: (floor: FloorLevel) => void;
   private zoneDialog: HTMLDivElement | null = null;
   private zoneNameInput: HTMLInputElement | null = null;
   private zoneDialogResolve: ((name: string | null) => void) | null = null;
   private zoneSidebar: HTMLElement | null = null;
   private zoneListEl: HTMLElement | null = null;
+  private floorListEl: HTMLElement | null = null;
   private zoneDrawMode: ZoneDrawMode = 'rectangle';
   private selectedZoneId: string | null = null;
   private polygonDraft: { points: ZonePoint[]; cursorX: number; cursorZ: number } | null = null;
   private zoneEdit: {
-    zone: FloorBlock;
+    block: FloorBlock;
     handle: ZoneEditHandle;
     startWorld: { x: number; z: number };
     snapshot: FloorBlock;
     historyPushed: boolean;
   } | null = null;
-
   constructor(parent: HTMLElement, _options: Floor2DViewOptions = {}) {
     if (getComputedStyle(parent).position === 'static') {
       parent.style.position = 'relative';
@@ -144,22 +153,34 @@ export class Floor2DView {
     const sidebar = document.createElement('aside');
     sidebar.className = 'floor2d-zone-sidebar';
 
-    const header = document.createElement('div');
-    header.className = 'floor2d-zone-sidebar__header';
-    header.textContent = 'Zones';
+    const floorHeader = document.createElement('div');
+    floorHeader.className = 'floor2d-zone-sidebar__header';
+    floorHeader.textContent = 'Floors';
 
-    const hint = document.createElement('div');
-    hint.className = 'floor2d-zone-sidebar__hint';
-    hint.textContent = 'Click a zone to zoom — use Edit Zone to move dots';
+    const floorHint = document.createElement('div');
+    floorHint.className = 'floor2d-zone-sidebar__hint';
+    floorHint.textContent = 'Set Y, draw, Add Floor — click a level to return to its slice';
 
-    const list = document.createElement('div');
-    list.className = 'floor2d-zone-list';
+    const floorList = document.createElement('div');
+    floorList.className = 'floor2d-zone-list floor2d-floor-list';
 
-    sidebar.append(header, hint, list);
+    const zoneHeader = document.createElement('div');
+    zoneHeader.className = 'floor2d-zone-sidebar__header floor2d-zone-sidebar__header--zones';
+    zoneHeader.textContent = 'Zones';
+
+    const zoneHint = document.createElement('div');
+    zoneHint.className = 'floor2d-zone-sidebar__hint';
+    zoneHint.textContent = 'Click a zone to zoom — use Edit Zone to change or delete';
+
+    const zoneList = document.createElement('div');
+    zoneList.className = 'floor2d-zone-list';
+
+    sidebar.append(floorHeader, floorHint, floorList, zoneHeader, zoneHint, zoneList);
     layout.insertBefore(sidebar, mapParent);
 
     this.zoneSidebar = sidebar;
-    this.zoneListEl = list;
+    this.floorListEl = floorList;
+    this.zoneListEl = zoneList;
   }
 
   private buildZoneNameDialog(parent: HTMLElement): void {
@@ -244,12 +265,17 @@ export class Floor2DView {
   private zoneDialogOkBtn: HTMLButtonElement | null = null;
   private zoneDialogTitle: HTMLDivElement | null = null;
 
-  private askZoneName(defaultName = '', mode: 'create' | 'rename' = 'create'): Promise<string | null> {
+  private askRegionName(
+    kind: 'zone' | 'floor',
+    defaultName = '',
+    mode: 'create' | 'rename' = 'create',
+  ): Promise<string | null> {
     if (!this.zoneDialog || !this.zoneNameInput || !this.zoneDialogOkBtn || !this.zoneDialogTitle) {
       return Promise.resolve(defaultName.trim() || null);
     }
-    this.zoneDialogTitle.textContent = mode === 'rename' ? 'Rename zone' : 'Zone name';
-    this.zoneDialogOkBtn.textContent = mode === 'rename' ? 'Save' : 'Add Zone';
+    const noun = kind === 'floor' ? 'floor' : 'zone';
+    this.zoneDialogTitle.textContent = mode === 'rename' ? `Rename ${noun}` : `${noun[0].toUpperCase()}${noun.slice(1)} name`;
+    this.zoneDialogOkBtn.textContent = mode === 'rename' ? 'Save' : kind === 'floor' ? 'Add Floor' : 'Add Zone';
     this.zoneNameInput.value = defaultName;
     this.zoneDialog.style.display = 'flex';
     this.zoneNameInput.focus();
@@ -257,6 +283,14 @@ export class Floor2DView {
     return new Promise((resolve) => {
       this.zoneDialogResolve = resolve;
     });
+  }
+
+  private askZoneName(defaultName = '', mode: 'create' | 'rename' = 'create'): Promise<string | null> {
+    return this.askRegionName('zone', defaultName, mode);
+  }
+
+  private askFloorName(defaultName = '', mode: 'create' | 'rename' = 'create'): Promise<string | null> {
+    return this.askRegionName('floor', defaultName, mode);
   }
 
   private async commitNewZone(rect: FloorBlock, shape: 'rectangle' | 'polygon' = 'rectangle', points?: ZonePoint[]): Promise<void> {
@@ -300,6 +334,98 @@ export class Floor2DView {
     );
   }
 
+  /** Save the current canvas edits onto the active floor level. */
+  flushCurrentFloorState(): void {
+    if (!this.activeFloorId || !this.map || !this.editWalk) return;
+    const floor = this.editFloors.find((f) => f.id === this.activeFloorId);
+    if (!floor) return;
+    if (!floorLevelSliceMatches(this.map, floor)) return;
+    floor.walkGrid = Array.from(this.editWalk);
+    floor.objects = cloneBlocks(this.editObjects);
+    floor.zones = cloneBlocks(this.editZones);
+    floor.gridCols = this.map.cols;
+    floor.gridRows = this.map.rows;
+    floor.gridCellSize = this.map.cellSize;
+    floor.gridMinX = this.map.minX;
+    floor.gridMinZ = this.map.minZ;
+  }
+
+  private captureCurrentEditsToFloor(floor: FloorLevel): void {
+    if (!this.map || !this.editWalk) return;
+    floor.walkGrid = Array.from(this.editWalk);
+    floor.objects = cloneBlocks(this.editObjects);
+    floor.zones = cloneBlocks(this.editZones);
+    floor.gridCols = this.map.cols;
+    floor.gridRows = this.map.rows;
+    floor.gridCellSize = this.map.cellSize;
+    floor.gridMinX = this.map.minX;
+    floor.gridMinZ = this.map.minZ;
+  }
+
+  /** Register current slice Y as a new named level (Floor 1, Floor 2, …). */
+  addFloorLevel(floorY: number): FloorLevel {
+    this.flushCurrentFloorState();
+    const floor: FloorLevel = {
+      id: `floor-${++this.floorIdSeq}`,
+      label: defaultFloorLabel(this.editFloors.length + 1),
+      floorY,
+    };
+    if (this.map && Math.abs((this.map.sliceY ?? floorY) - floorY) < 1e-4) {
+      this.captureCurrentEditsToFloor(floor);
+    }
+    this.editFloors.push(floor);
+    this.activeFloorId = floor.id;
+    this.refreshFloorSidebar();
+    this.notifyFloorsChange();
+    return floor;
+  }
+
+  getActiveFloor(): FloorLevel | null {
+    return this.editFloors.find((f) => f.id === this.activeFloorId) ?? null;
+  }
+
+  getActiveFloorId(): string | null {
+    return this.activeFloorId;
+  }
+
+  getFloorLevels(): FloorLevel[] {
+    return cloneFloorLevels(this.editFloors);
+  }
+
+  clearFloorLevels(): void {
+    this.editFloors = [];
+    this.activeFloorId = null;
+    this.floorIdSeq = 0;
+    this.refreshFloorSidebar();
+    this.notifyFloorsChange();
+  }
+
+  clearActiveFloor(): void {
+    this.activeFloorId = null;
+    this.refreshFloorSidebar();
+  }
+
+  async renameActiveFloor(): Promise<boolean> {
+    const floor = this.getActiveFloor();
+    if (!floor) return false;
+    const name = await this.askFloorName(floor.label, 'rename');
+    if (!name || name === floor.label) return false;
+    floor.label = name;
+    this.refreshFloorSidebar();
+    this.notifyFloorsChange();
+    return true;
+  }
+
+  activateFloorLevel(floorId: string): FloorLevel | null {
+    const floor = this.editFloors.find((f) => f.id === floorId);
+    if (!floor) return null;
+    this.flushCurrentFloorState();
+    this.activeFloorId = floor.id;
+    this.refreshFloorSidebar();
+    this.onFloorActivate?.(floor);
+    return floor;
+  }
+
   setZoneDrawMode(mode: ZoneDrawMode): void {
     this.zoneDrawMode = mode;
     this.polygonDraft = null;
@@ -312,26 +438,70 @@ export class Floor2DView {
 
   selectZone(id: string | null): void {
     this.selectedZoneId = id;
+    this.onZoneSelectionChange?.(id);
     this.refreshZoneSidebar();
     this.draw();
   }
 
   focusZone(zone: FloorBlock): void {
+    this.focusRegion(zone);
+  }
+
+  private focusRegion(block: FloorBlock): void {
     const parent = this.canvas.parentElement;
     if (!parent) return;
     const dpr = Math.min(window.devicePixelRatio, 2);
     const vw = Math.max(1, parent.clientWidth);
     const vh = Math.max(1, parent.clientHeight);
     const pad = 48;
-    const zoomW = Math.max(zone.w, 0.5);
-    const zoomH = Math.max(zone.d, 0.5);
-    const c = zoneCentroid(zone);
+    const zoomW = Math.max(block.w, 0.5);
+    const zoomH = Math.max(block.d, 0.5);
+    const c = regionCentroid(block);
     this.canvas.width = Math.floor(vw * dpr);
     this.canvas.height = Math.floor(vh * dpr);
     this.scale = Math.min((vw - pad) / zoomW, (vh - pad) / zoomH) * dpr;
     this.offsetX = this.canvas.width / 2 - c.x * this.scale;
     this.offsetY = this.canvas.height / 2 - c.z * this.scale;
     this.draw();
+  }
+
+  private refreshFloorSidebar(): void {
+    if (!this.floorListEl) return;
+    this.floorListEl.replaceChildren();
+    if (this.editFloors.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'floor2d-zone-list__empty';
+      empty.textContent = 'No floors yet — use Add Floor';
+      this.floorListEl.appendChild(empty);
+      return;
+    }
+    for (const floor of this.editFloors) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'floor2d-zone-item';
+      if (floor.id === this.activeFloorId) {
+        btn.classList.add('floor2d-zone-item--floor-active');
+      }
+
+      const dot = document.createElement('span');
+      dot.className = 'floor2d-zone-item__dot';
+      dot.style.background = FLOOR2D_STYLE.floorRegionBorder;
+
+      const name = document.createElement('span');
+      name.className = 'floor2d-zone-item__name';
+      name.textContent = `${floor.label.trim() || 'Untitled floor'} (Y=${floor.floorY})`;
+
+      btn.append(dot, name);
+      btn.addEventListener('click', () => {
+        this.activateFloorLevel(floor.id);
+      });
+      btn.addEventListener('dblclick', (e) => {
+        e.preventDefault();
+        this.activeFloorId = floor.id;
+        void this.renameActiveFloor();
+      });
+      this.floorListEl.appendChild(btn);
+    }
   }
 
   private refreshZoneSidebar(): void {
@@ -348,7 +518,9 @@ export class Floor2DView {
       const btn = document.createElement('button');
       btn.type = 'button';
       btn.className = 'floor2d-zone-item';
-      if (zone.id === this.selectedZoneId) btn.classList.add('floor2d-zone-item--active');
+      if (zone.id === this.selectedZoneId && this.isZoneEditTool()) {
+        btn.classList.add('floor2d-zone-item--active');
+      }
 
       const dot = document.createElement('span');
       dot.className = 'floor2d-zone-item__dot';
@@ -360,8 +532,7 @@ export class Floor2DView {
 
       btn.append(dot, name);
       btn.addEventListener('click', () => {
-        this.setTool('zone-edit');
-        this.selectZone(zone.id);
+        if (this.isZoneEditTool()) this.selectZone(zone.id);
         this.focusZone(zone);
       });
       this.zoneListEl.appendChild(btn);
@@ -384,8 +555,43 @@ export class Floor2DView {
     this.onZonesChange = fn;
   }
 
+  setOnFloorsChange(fn: () => void): void {
+    this.onFloorsChange = fn;
+  }
+
   setOnRouteRebuild(fn: () => void): void {
     this.onRouteRebuild = fn;
+  }
+
+  setOnZoneSelectionChange(fn: (zoneId: string | null) => void): void {
+    this.onZoneSelectionChange = fn;
+    fn(this.selectedZoneId);
+  }
+
+  setOnFloorActivate(fn: (floor: FloorLevel) => void): void {
+    this.onFloorActivate = fn;
+  }
+
+  deleteSelectedZone(): boolean {
+    if (!this.selectedZoneId) return false;
+    this.pushHistory();
+    this.editZones = this.editZones.filter((z) => z.id !== this.selectedZoneId);
+    this.selectZone(null);
+    this.notifyZonesChange();
+    this.draw();
+    return true;
+  }
+
+  deleteActiveFloor(): boolean {
+    if (!this.activeFloorId) return false;
+    const removed = this.activeFloorId;
+    this.editFloors = this.editFloors.filter((f) => f.id !== removed);
+    this.activeFloorId = this.editFloors[0]?.id ?? null;
+    this.refreshFloorSidebar();
+    this.notifyFloorsChange();
+    const next = this.getActiveFloor();
+    if (next) this.onFloorActivate?.(next);
+    return true;
   }
 
   /** Zones available as origin/destination (navigate to center point). */
@@ -396,10 +602,54 @@ export class Floor2DView {
     }));
   }
 
+  /** Named floor regions for origin/destination routing. */
+  getRouteFloors(): { id: string; label: string; floorY?: number }[] {
+    return this.editFloors.map((f) => ({
+      id: f.id,
+      label: f.label.trim() || 'Untitled floor',
+      floorY: f.floorY,
+    }));
+  }
+
+  /**
+   * Route on painted walkable floor (A* grid) — avoids objects/blocks, not Recast nav mesh.
+   */
+  computeRoutePath(
+    startX: number,
+    startZ: number,
+    endX: number,
+    endZ: number,
+    floorY: number,
+  ): { path: { x: number; y: number; z: number }[]; error?: string } {
+    if (!this.map || !this.editWalk) {
+      return { path: [], error: 'Floor map not ready' };
+    }
+    const out = findPathOnFloorGrid(
+      this.map,
+      this.editWalk,
+      this.editObjects,
+      startX,
+      startZ,
+      endX,
+      endZ,
+      floorY,
+    );
+    if ('error' in out) return { path: [], error: out.error };
+    return { path: out.path };
+  }
+
   resolveRouteEndpoint(
     id: string,
     sliceY: number,
   ): { x: number; y: number; z: number; name: string } | null {
+    const floorId = parseFloorRouteId(id);
+    if (floorId) {
+      const floor = this.editFloors.find((f) => f.id === floorId);
+      if (!floor || !this.map) return null;
+      const x = (this.map.minX + this.map.maxX) * 0.5;
+      const z = (this.map.minZ + this.map.maxZ) * 0.5;
+      return { x, y: floor.floorY, z, name: floor.label.trim() || 'Untitled floor' };
+    }
     const zoneId = parseZoneRouteId(id);
     if (zoneId) {
       const zone = this.editZones.find((z) => z.id === zoneId);
@@ -414,6 +664,10 @@ export class Floor2DView {
 
   private notifyZonesChange(): void {
     this.onZonesChange?.();
+  }
+
+  private notifyFloorsChange(): void {
+    this.onFloorsChange?.();
   }
 
   canUndo(): boolean {
@@ -434,6 +688,8 @@ export class Floor2DView {
     if (this.selectedZoneId && !this.editZones.some((z) => z.id === this.selectedZoneId)) {
       this.selectedZoneId = null;
     }
+    this.flushCurrentFloorState();
+    this.refreshFloorSidebar();
     this.refreshZoneSidebar();
     this.notifyZonesChange();
     this.syncEditState();
@@ -451,6 +707,8 @@ export class Floor2DView {
     if (this.selectedZoneId && !this.editZones.some((z) => z.id === this.selectedZoneId)) {
       this.selectedZoneId = null;
     }
+    this.flushCurrentFloorState();
+    this.refreshFloorSidebar();
     this.refreshZoneSidebar();
     this.notifyZonesChange();
     this.syncEditState();
@@ -495,7 +753,8 @@ export class Floor2DView {
 
   saveEdits(): boolean {
     if (!this.map || !this.editWalk) return false;
-    this.map = applyWalkGridEdits(this.map, this.editWalk, this.editObjects, this.editZones);
+    this.flushCurrentFloorState();
+    this.map = applyWalkGridEdits(this.map, this.editWalk, this.editObjects, this.editZones, this.editFloors);
     this.clearHistory();
     this.draw();
     return true;
@@ -508,25 +767,79 @@ export class Floor2DView {
   /** Snapshot for DB persistence (includes walk grid + named zones). */
   exportEditPayload(sliceY: number, mapCode: string): NavmeFloorEditPayload | null {
     if (!this.map || !this.editWalk) return null;
-    return buildFloorEditPayload(this.map, this.editWalk, this.editObjects, this.editZones, sliceY, mapCode);
+    this.flushCurrentFloorState();
+    const active = this.getActiveFloor();
+    return buildFloorEditPayload(
+      this.map,
+      this.editWalk,
+      this.editObjects,
+      this.editZones,
+      this.editFloors,
+      active?.floorY ?? sliceY,
+      mapCode,
+    );
   }
 
-  getEditStateForSave(): { map: Floor2DMap; walk: Uint8Array; objects: FloorBlock[]; zones: FloorBlock[] } | null {
+  getEditStateForSave(): {
+    map: Floor2DMap;
+    walk: Uint8Array;
+    objects: FloorBlock[];
+    zones: FloorBlock[];
+    floors: FloorLevel[];
+  } | null {
     if (!this.map || !this.editWalk) return null;
+    this.flushCurrentFloorState();
     return {
-      map: this.map,
+      map: { ...this.map, floors: cloneFloorLevels(this.editFloors) },
       walk: this.editWalk,
       objects: cloneBlocks(this.editObjects),
       zones: cloneBlocks(this.editZones),
+      floors: cloneFloorLevels(this.editFloors),
     };
   }
 
-  setMap(map: Floor2DMap): void {
-    this.map = map;
-    const blocks = map.corridors.length > 0 ? map.corridors : map.blocks;
-    this.editWalk = walkGridFromBlocks(map, blocks);
-    this.editObjects = cloneBlocks(map.objects ?? []);
-    this.editZones = cloneBlocks(map.zones ?? []);
+  setMap(map: Floor2DMap, options: { preserveFloors?: boolean; activeFloorId?: string | null } = {}): void {
+    const preserveFloors = options.preserveFloors === true;
+    const incomingFloors = map.floors ?? [];
+
+    if (!preserveFloors) {
+      if (incomingFloors.length > 0) {
+        this.editFloors = cloneFloorLevels(incomingFloors);
+        this.floorIdSeq = this.editFloors.reduce((max, f) => {
+          const m = /^floor-(\d+)$/.exec(f.id);
+          return m ? Math.max(max, parseInt(m[1], 10)) : max;
+        }, 0);
+        const match =
+          this.editFloors.find((f) => Math.abs(f.floorY - map.sliceY) < 1e-4) ??
+          this.editFloors[0] ??
+          null;
+        this.activeFloorId = options.activeFloorId ?? match?.id ?? null;
+      } else if (this.editFloors.length === 0) {
+        this.activeFloorId = options.activeFloorId ?? null;
+      } else if (options.activeFloorId !== undefined) {
+        this.activeFloorId = options.activeFloorId;
+      }
+    } else if (options.activeFloorId !== undefined) {
+      this.activeFloorId = options.activeFloorId;
+    }
+
+    this.map = { ...map, floors: cloneFloorLevels(this.editFloors) };
+    const active = this.getActiveFloor();
+    if (active && floorLevelGridMatches(map, active)) {
+      this.editWalk = new Uint8Array(active.walkGrid!.map((v) => (v ? 1 : 0)));
+      this.editObjects = cloneBlocks(active.objects ?? []);
+      this.editZones = cloneBlocks(active.zones ?? []);
+    } else if (active && floorLevelSliceMatches(map, active) && active.walkGrid?.length) {
+      this.editWalk = new Uint8Array(active.walkGrid.map((v) => (v ? 1 : 0)));
+      this.editObjects = cloneBlocks(active.objects ?? []);
+      this.editZones = cloneBlocks(active.zones ?? []);
+    } else {
+      const blocks = map.corridors.length > 0 ? map.corridors : map.blocks;
+      this.editWalk = walkGridFromBlocks(map, blocks);
+      this.editObjects = cloneBlocks(map.objects ?? []);
+      this.editZones = cloneBlocks(map.zones ?? []);
+    }
+
     this.objectIdSeq = this.editObjects.reduce((max, o) => {
       const m = /^obj-(\d+)$/.exec(o.id);
       return m ? Math.max(max, parseInt(m[1], 10)) : max;
@@ -539,8 +852,10 @@ export class Floor2DView {
     this.polygonDraft = null;
     this.clearHistory();
     this.fit();
+    this.refreshFloorSidebar();
     this.refreshZoneSidebar();
     this.notifyZonesChange();
+    this.notifyFloorsChange();
     this.draw();
   }
 
@@ -644,7 +959,7 @@ export class Floor2DView {
 
   private previewMap(): Floor2DMap | null {
     if (!this.map || !this.editWalk) return null;
-    return applyWalkGridEdits(this.map, this.editWalk, this.editObjects, this.editZones);
+    return applyWalkGridEdits(this.map, this.editWalk, this.editObjects, this.editZones, this.editFloors);
   }
 
   private wx(x: number): number {
@@ -667,76 +982,10 @@ export class Floor2DView {
     return HANDLE_RADIUS_PX / Math.max(this.scale, 0.001);
   }
 
-  private hitZoneHandle(x: number, z: number): { zone: FloorBlock; handle: ZoneEditHandle } | null {
-    if (!this.isZoneEditTool()) return null;
-    const thresh = this.handleRadiusWorld() ** 2;
-    const selected = this.editZones.find((z) => z.id === this.selectedZoneId);
-    const zones = selected
-      ? [selected, ...this.editZones.filter((z) => z.id !== selected.id)]
-      : [...this.editZones];
-
-    for (const zone of zones) {
-      if (isPolygonZone(zone) && zone.points) {
-        for (let i = 0; i < zone.points.length; i++) {
-          const p = zone.points[i];
-          if (dist2(x, z, p.x, p.z) <= thresh) {
-            this.selectZone(zone.id);
-            return { zone, handle: { kind: 'vertex', index: i } };
-          }
-        }
-        continue;
-      }
-
-      const corners = [
-        { corner: 'nw' as const, x: zone.x, z: zone.z },
-        { corner: 'ne' as const, x: zone.x + zone.w, z: zone.z },
-        { corner: 'sw' as const, x: zone.x, z: zone.z + zone.d },
-        { corner: 'se' as const, x: zone.x + zone.w, z: zone.z + zone.d },
-      ];
-      for (const c of corners) {
-        if (dist2(x, z, c.x, c.z) <= thresh) {
-          this.selectZone(zone.id);
-          return { zone, handle: { kind: 'resize', corner: c.corner } };
-        }
-      }
-    }
-    return null;
-  }
-
   private applyZoneEdit(x: number, z: number): void {
     if (!this.zoneEdit) return;
-    const { zone, handle, startWorld, snapshot } = this.zoneEdit;
-    const dx = x - startWorld.x;
-    const dz = z - startWorld.z;
-
-    if (handle.kind === 'move') {
-      if (isPolygonZone(snapshot) && snapshot.points) {
-        zone.points = cloneZonePoints(snapshot.points)!;
-        translateZone(zone, dx, dz);
-      } else {
-        zone.x = snapshot.x + dx;
-        zone.z = snapshot.z + dz;
-        zone.w = snapshot.w;
-        zone.d = snapshot.d;
-      }
-      return;
-    }
-
-    if (handle.kind === 'vertex' && snapshot.points) {
-      zone.points = cloneZonePoints(snapshot.points)!;
-      zone.points[handle.index].x = snapshot.points[handle.index].x + dx;
-      zone.points[handle.index].z = snapshot.points[handle.index].z + dz;
-      syncZoneBounds(zone);
-      return;
-    }
-
-    if (handle.kind === 'resize') {
-      zone.x = snapshot.x;
-      zone.z = snapshot.z;
-      zone.w = snapshot.w;
-      zone.d = snapshot.d;
-      resizeRectZone(zone, handle.corner, x, z);
-    }
+    const { block, handle, startWorld, snapshot } = this.zoneEdit;
+    applyRegionEdit(block, handle, snapshot, startWorld, x, z);
   }
 
   private bindKeyboard(): void {
@@ -755,45 +1004,48 @@ export class Floor2DView {
         return;
       }
 
-      if (!this.isZoneEditTool()) return;
-
-      if (e.key === 'Escape') {
-        this.zoneEdit = null;
-        this.selectZone(null);
-      } else if ((e.key === 'Delete' || e.key === 'Backspace') && this.selectedZoneId) {
-        e.preventDefault();
-        this.pushHistory();
-        this.editZones = this.editZones.filter((z) => z.id !== this.selectedZoneId);
-        this.selectZone(null);
-        this.refreshZoneSidebar();
-        this.notifyZonesChange();
-        this.draw();
+      if (this.isZoneEditTool()) {
+        if (e.key === 'Escape') {
+          this.zoneEdit = null;
+          this.selectZone(null);
+        } else if ((e.key === 'Delete' || e.key === 'Backspace') && this.selectedZoneId) {
+          e.preventDefault();
+          this.deleteSelectedZone();
+        }
+        return;
       }
     });
   }
 
   private beginZoneEditPointer(w: { x: number; z: number }): boolean {
-    const handleHit = this.hitZoneHandle(w.x, w.z);
+    const handleHit = hitRegionHandle(
+      this.editZones,
+      this.selectedZoneId,
+      w.x,
+      w.z,
+      this.handleRadiusWorld(),
+    );
     if (handleHit) {
+      this.selectZone(handleHit.block.id);
       this.zoneEdit = {
-        zone: handleHit.zone,
+        block: handleHit.block,
         handle: handleHit.handle,
         startWorld: w,
-        snapshot: cloneZoneBlock(handleHit.zone),
+        snapshot: cloneRegionBlock(handleHit.block),
         historyPushed: false,
       };
       this.canvas.style.cursor = 'grabbing';
       return true;
     }
 
-    const zoneHit = this.hitTestZone(w.x, w.z);
+    const zoneHit = hitTestRegion(this.editZones, w.x, w.z);
     if (zoneHit) {
       this.selectZone(zoneHit.id);
       this.zoneEdit = {
-        zone: zoneHit,
+        block: zoneHit,
         handle: { kind: 'move' },
         startWorld: w,
-        snapshot: cloneZoneBlock(zoneHit),
+        snapshot: cloneRegionBlock(zoneHit),
         historyPushed: false,
       };
       this.canvas.style.cursor = 'grab';
@@ -824,6 +1076,7 @@ export class Floor2DView {
       }
 
       if (this.tool === 'zone') {
+        // Add Zone: never select or edit existing zones — draw only.
         if (this.zoneDrawMode === 'polygon') {
           const closeDist = CLOSE_POLY_DIST_PX / Math.max(this.scale, 0.001);
           if (this.polygonDraft && this.polygonDraft.points.length >= 3) {
@@ -939,6 +1192,9 @@ export class Floor2DView {
               shape: this.objectShape,
             });
           }
+          if (this.tool === 'add' || this.tool === 'cut' || this.tool === 'object') {
+            this.onRouteRebuild?.();
+          }
         }
         this.draft = null;
       }
@@ -962,28 +1218,25 @@ export class Floor2DView {
     );
 
     this.canvas.addEventListener('dblclick', (e) => {
-      if (!this.map || !this.isZoneEditTool()) return;
+      if (!this.map) return;
       const w = this.screenToWorld(e.clientX, e.clientY);
-      const zoneHit = this.hitTestZone(w.x, w.z);
-      if (zoneHit) {
-        void (async () => {
-          const name = await this.askZoneName(zoneHit.label, 'rename');
-          if (name && name !== zoneHit.label) {
-            this.pushHistory();
-            zoneHit.label = name;
-            this.refreshZoneSidebar();
-          }
-          this.draw();
-        })();
+      if (this.isZoneEditTool()) {
+        const zoneHit = hitTestRegion(this.editZones, w.x, w.z);
+        if (zoneHit) {
+          void (async () => {
+            const name = await this.askZoneName(zoneHit.label, 'rename');
+            if (name && name !== zoneHit.label) {
+              this.pushHistory();
+              zoneHit.label = name;
+              this.refreshZoneSidebar();
+              this.notifyZonesChange();
+            }
+            this.draw();
+          })();
+        }
+        return;
       }
     });
-  }
-
-  private hitTestZone(x: number, z: number): FloorBlock | null {
-    for (let i = this.editZones.length - 1; i >= 0; i--) {
-      if (pointInsideZone(x, z, this.editZones[i])) return this.editZones[i];
-    }
-    return null;
   }
 
   private drawShape(
@@ -1168,10 +1421,14 @@ export class Floor2DView {
     drawHandle(zone.x + zone.w, zone.z + zone.d);
   }
 
-  private drawPolygonDraft(ctx: CanvasRenderingContext2D, dpr: number): void {
-    if (!this.polygonDraft || this.polygonDraft.points.length === 0) return;
-    const pts = this.polygonDraft.points;
-    const stroke = FLOOR2D_STYLE.accent;
+  private drawRegionPolygonDraft(
+    ctx: CanvasRenderingContext2D,
+    dpr: number,
+    draft: { points: ZonePoint[]; cursorX: number; cursorZ: number } | null,
+    stroke: string,
+  ): void {
+    if (!draft || draft.points.length === 0) return;
+    const pts = draft.points;
     ctx.save();
     ctx.strokeStyle = stroke;
     ctx.lineWidth = Math.max(2, 2.5 * dpr);
@@ -1181,7 +1438,7 @@ export class Floor2DView {
     for (let i = 1; i < pts.length; i++) {
       ctx.lineTo(this.wx(pts[i].x), this.wz(pts[i].z));
     }
-    ctx.lineTo(this.wx(this.polygonDraft.cursorX), this.wz(this.polygonDraft.cursorZ));
+    ctx.lineTo(this.wx(draft.cursorX), this.wz(draft.cursorZ));
     ctx.stroke();
     ctx.setLineDash([]);
     ctx.fillStyle = stroke;
@@ -1193,17 +1450,28 @@ export class Floor2DView {
     ctx.restore();
   }
 
+  private drawPolygonDraft(ctx: CanvasRenderingContext2D, dpr: number): void {
+    ctx.save();
+    ctx.globalAlpha = FLOOR2D_STYLE.zoneStrokeOpacity;
+    this.drawRegionPolygonDraft(ctx, dpr, this.polygonDraft, FLOOR2D_STYLE.accent);
+    ctx.restore();
+  }
+
   private drawZones(ctx: CanvasRenderingContext2D, dpr: number): void {
     const lineW = Math.max(2, 2.5 * dpr);
+    const zoneAlpha = FLOOR2D_STYLE.zoneStrokeOpacity;
     for (const b of this.editZones) {
       const stroke = b.stroke || FLOOR2D_STYLE.accent;
       const selected = b.id === this.selectedZoneId;
+      ctx.save();
+      ctx.globalAlpha = selected ? Math.min(1, zoneAlpha + 0.18) : zoneAlpha;
       this.drawZoneOutline(ctx, b, stroke, lineW, true, selected);
       const x = this.wx(b.x);
       const y = this.wz(b.z);
       const w = b.w * this.scale;
       const h = b.d * this.scale;
       this.drawZoneLabel(ctx, x, y, w, h, b.label, dpr, stroke);
+      ctx.restore();
       if (selected && this.isZoneEditTool()) this.drawZoneHandles(ctx, b, dpr);
     }
   }
@@ -1213,6 +1481,7 @@ export class Floor2DView {
     ctx.lineWidth = lineW;
     ctx.strokeStyle = FLOOR2D_STYLE.wallLight;
     ctx.fillStyle = FLOOR2D_STYLE.store;
+    ctx.globalAlpha = 0.88;
     for (const b of m.stores) {
       const x = this.wx(b.x);
       const y = this.wz(b.z);
@@ -1220,8 +1489,9 @@ export class Floor2DView {
       const h = b.d * this.scale;
       ctx.fillRect(x, y, w, h);
       ctx.strokeRect(x + lineW * 0.5, y + lineW * 0.5, w - lineW, h - lineW);
-      this.drawZoneLabel(ctx, x, y, w, h, zoneDisplayLabel(b, this.pois), dpr);
+      this.drawZoneLabel(ctx, x, y, w, h, zoneDisplayLabel(b, this.pois), dpr, FLOOR2D_STYLE.zoneLabel);
     }
+    ctx.globalAlpha = 1;
   }
 
   private drawWalls(ctx: CanvasRenderingContext2D, m: Floor2DMap, dpr: number): void {
@@ -1397,6 +1667,7 @@ export class Floor2DView {
     this.zoneDialogTitle = null;
     this.zoneSidebar = null;
     this.zoneListEl = null;
+    this.floorListEl = null;
     this.canvas.remove();
   }
 }

@@ -18,9 +18,60 @@ export type FloorBlock = {
   points?: FloorPoint[];
   /** Border color for labeled zones (dotted outline). */
   stroke?: string;
+  /** Slice Y for named floor regions. */
+  floorY?: number;
 };
 
 export type WallSeg = { x1: number; z1: number; x2: number; z2: number };
+
+/** A named floor level at a fixed Y slice (not a drawn map region). */
+export type FloorLevel = {
+  id: string;
+  label: string;
+  floorY: number;
+  /** Painted walk grid for this level (when grid size matches the map). */
+  walkGrid?: number[];
+  objects?: FloorBlock[];
+  zones?: FloorBlock[];
+  gridCols?: number;
+  gridRows?: number;
+  gridCellSize?: number;
+  gridMinX?: number;
+  gridMinZ?: number;
+};
+
+export function cloneFloorLevels(levels: FloorLevel[]): FloorLevel[] {
+  return levels.map((f) => ({
+    ...f,
+    walkGrid: f.walkGrid ? [...f.walkGrid] : undefined,
+    objects: f.objects?.map((o) => ({
+      ...o,
+      points: o.points?.map((p) => ({ x: p.x, z: p.z })),
+    })),
+    zones: f.zones?.map((z) => ({
+      ...z,
+      points: z.points?.map((p) => ({ x: p.x, z: p.z })),
+    })),
+  }));
+}
+
+export function floorLevelSliceMatches(map: Floor2DMap, floor: FloorLevel): boolean {
+  return Math.abs(floor.floorY - map.sliceY) < 1e-4;
+}
+
+export function floorLevelGridMatches(map: Floor2DMap, floor: FloorLevel): boolean {
+  if (!floorLevelSliceMatches(map, floor)) return false;
+  if (!Array.isArray(floor.walkGrid) || floor.walkGrid.length !== map.cols * map.rows) return false;
+  if (floor.gridCols !== map.cols || floor.gridRows !== map.rows) return false;
+  if (floor.gridCellSize !== undefined && Math.abs(floor.gridCellSize - map.cellSize) > 1e-6) return false;
+  if (floor.gridMinX !== undefined && Math.abs(floor.gridMinX - map.minX) > 1e-3) return false;
+  if (floor.gridMinZ !== undefined && Math.abs(floor.gridMinZ - map.minZ) > 1e-3) return false;
+  return true;
+}
+
+export function defaultFloorLabel(index: number): string {
+  return `Floor ${index}`;
+}
 
 export type Floor2DMap = {
   sliceY: number;
@@ -39,6 +90,8 @@ export type Floor2DMap = {
   objects: FloorBlock[];
   /** Labeled regions — dotted colorful outline, not walkable edits. */
   zones: FloorBlock[];
+  /** Named building levels — each level is a slice Y (e.g. Ground Floor, Floor 2). */
+  floors: FloorLevel[];
   /** @deprecated use corridors */
   blocks: FloorBlock[];
   walls: WallSeg[];
@@ -48,7 +101,8 @@ export type Floor2DMap = {
 export const FLOOR2D_STYLE = {
   background: '#f5f5f5',
   corridor: '#f5f5f5',
-  store: '#e0e0e0',
+  /** Auto-detected room/store fill — muted gray (not heavy). */
+  store: '#ececec',
   object: '#ffffff',
   objectBorder: '#999999',
   objectLabel: '#9c27b0',
@@ -57,16 +111,23 @@ export const FLOOR2D_STYLE = {
   route: '#3b6fd9',
   routeOutline: '#ffffff',
   routeDot: '#2a55b8',
-  zoneLabel: '#9c27b0',
+  zoneLabel: '#8a7a96',
   navMesh: 'rgba(156,39,176,0.12)',
   navMeshStroke: 'rgba(156,39,176,0.35)',
   poiLabel: '#9c27b0',
   poiMarker: '#e0e0e0',
   poiMarkerBorder: '#ffffff',
-  accent: '#9c27b0',
+  accent: '#8e7d9a',
   origin: '#4caf50',
   destination: '#9c27b0',
-  zoneStrokeColors: ['#9c27b0', '#ff9800', '#00bcd4', '#e91e63', '#4caf50', '#3f51b5'],
+  /** Muted zone outline + label hues (dark family, lower saturation). */
+  zoneStrokeColors: ['#8e7d9a', '#a08978', '#6f858a', '#9a7a84', '#7a8f7e', '#7a849c'],
+  /** Draw opacity for zone outlines and labels (0–1). */
+  zoneStrokeOpacity: 0.72,
+  floorRegion: 'rgba(33,150,243,0.18)',
+  floorRegionBorder: '#2196f3',
+  floorLabel: '#1565c0',
+  floorStrokeColors: ['#2196f3', '#00897b', '#5c6bc0', '#00acc1', '#43a047', '#6d4c41'],
 } as const;
 
 const CORRIDOR_FILL = FLOOR2D_STYLE.corridor;
@@ -304,6 +365,7 @@ export function buildFloor2DFromMap(
       stores: [],
       objects: [],
       zones: [],
+      floors: [],
       blocks: [],
       walls: [],
     };
@@ -356,6 +418,7 @@ export function buildFloor2DFromMap(
     stores,
     objects: [],
     zones: [],
+    floors: [],
     blocks: corridors,
     walls,
   };
@@ -395,6 +458,7 @@ export function applyWalkGridEdits(
   walk: Uint8Array,
   objects: FloorBlock[] = [],
   zones: FloorBlock[] = [],
+  floors: FloorLevel[] = [],
 ): Floor2DMap {
   const merged = mergeRects(walk, map.cols, map.rows, map.minX, map.minZ, map.cellSize);
   const storeMask = extractStoreMask(walk, map.cols, map.rows);
@@ -407,6 +471,7 @@ export function applyWalkGridEdits(
     stores,
     objects: objects.map((o) => ({ ...o })),
     zones: zones.map((z) => ({ ...z })),
+    floors: cloneFloorLevels(floors),
     walls,
   };
 }
@@ -433,6 +498,11 @@ export function pointInsideBlock(x: number, z: number, block: FloorBlock): boole
 
 export function nextZoneStrokeColor(index: number): string {
   const colors = FLOOR2D_STYLE.zoneStrokeColors;
+  return colors[index % colors.length];
+}
+
+export function nextFloorStrokeColor(index: number): string {
+  const colors = FLOOR2D_STYLE.floorStrokeColors;
   return colors[index % colors.length];
 }
 

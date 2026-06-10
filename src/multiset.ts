@@ -278,24 +278,7 @@ function deepFindGlb(obj: unknown, depth = 0): string | null {
   return null;
 }
 
-async function fetchGlbArrayBuffer(downloadUrl: string, glbCorsProxyPostUrl?: string): Promise<ArrayBuffer> {
-  try {
-    const direct = await fetch(downloadUrl, { redirect: 'follow' });
-    if (direct.ok) return direct.arrayBuffer();
-  } catch {
-    /* CORS */
-  }
-  const postUrl =
-    typeof glbCorsProxyPostUrl === 'string' && glbCorsProxyPostUrl.trim() !== ''
-      ? glbCorsProxyPostUrl.trim()
-      : import.meta.env.DEV
-        ? '/api/proxy-external-fetch'
-        : undefined;
-  if (!postUrl) {
-    throw new Error(
-      'GLB download blocked by CORS. Use npm run dev (local GLB proxy) or set glbCorsProxyPostUrl to a streaming proxy.',
-    );
-  }
+async function fetchGlbViaProxy(downloadUrl: string, postUrl: string): Promise<ArrayBuffer> {
   const proxyRes = await fetch(postUrl, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -308,9 +291,39 @@ async function fetchGlbArrayBuffer(downloadUrl: string, glbCorsProxyPostUrl?: st
         'GLB is too large for the cloud edge proxy (546). Restart with npm run dev so Vite streams the file locally, or use a smaller mesh.',
       );
     }
-    throw new Error(`GLB download failed (${proxyRes.status}): ${hint.slice(0, 200)}`);
+    throw new Error(`GLB proxy download failed (${proxyRes.status}): ${hint.slice(0, 200)}`);
   }
   return proxyRes.arrayBuffer();
+}
+
+async function fetchGlbArrayBuffer(downloadUrl: string, glbCorsProxyPostUrl?: string): Promise<ArrayBuffer> {
+  const postUrl =
+    typeof glbCorsProxyPostUrl === 'string' && glbCorsProxyPostUrl.trim() !== ''
+      ? glbCorsProxyPostUrl.trim()
+      : import.meta.env.DEV
+        ? '/api/proxy-external-fetch'
+        : undefined;
+
+  if (postUrl) {
+    try {
+      return await fetchGlbViaProxy(downloadUrl, postUrl);
+    } catch (proxyErr) {
+      if (!import.meta.env.DEV) throw proxyErr;
+      console.warn('[multiset] GLB proxy failed, trying direct fetch:', proxyErr);
+    }
+  }
+
+  try {
+    const direct = await fetch(downloadUrl, { redirect: 'follow' });
+    if (direct.ok) return direct.arrayBuffer();
+    throw new Error(`GLB direct download failed (${direct.status})`);
+  } catch (err) {
+    if (postUrl) throw err;
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `GLB download blocked by CORS (${msg}). Run ./start.sh or npm run dev (local GLB proxy) or set glbCorsProxyPostUrl.`,
+    );
+  }
 }
 
 async function tryDownload(

@@ -15,8 +15,14 @@ export const NAV_MESH_WALKABLE_HEIGHT = 2;
 export const NAV_MESH_WALKABLE_CLIMB = 0.3;
 export const FAST_NAV_MESH = true;
 export const FALLBACK_FULL_NAV_MESH = true;
-/** Snap + path query box (customizeroute: wide horizontal, tall vertical). */
-export const NAV_MESH_QUERY_HALF_EXTENTS = { x: 4, y: 50, z: 4 };
+/**
+ * Snap + path query box. Keep Y modest (2–4 m) so POIs snap to the same floor slice —
+ * a huge Y (e.g. 50) lets findNearestPoly pick walkable mesh on another level and the
+ * route line cuts through voids on the 2D map.
+ */
+export const NAV_MESH_QUERY_HALF_EXTENTS = { x: 4, y: 3, z: 4 };
+/** Extra vertical band when snapping at a known floor slice Y (2D navigation). */
+export const NAV_MESH_FLOOR_QUERY_HALF_EXTENTS_Y = 2.5;
 /** Corner cut distance when softening nav route bends. */
 export const ROUTE_CORNER_SOFTEN_DIST = 0.55;
 /** Y offset for non-camera POI snap sampling (NavigationRoute cameraPositionOffset[1]). */

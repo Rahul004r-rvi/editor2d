@@ -29,11 +29,16 @@ function computeNavPath(
   navMesh: NavMesh | null,
   startVec: THREE.Vector3,
   endVec: THREE.Vector3,
+  floorSliceY?: number,
 ): { path: THREE.Vector3[]; error: null } | { path: null; error: string } {
-  const out = computeNavigationRoutePath(navMesh, [
-    { x: startVec.x, y: startVec.y, z: startVec.z },
-    { x: endVec.x, y: endVec.y, z: endVec.z },
-  ]);
+  const out = computeNavigationRoutePath(
+    navMesh,
+    [
+      { x: startVec.x, y: startVec.y, z: startVec.z },
+      { x: endVec.x, y: endVec.y, z: endVec.z },
+    ],
+    { floorSliceY },
+  );
   if ('error' in out) return { path: null, error: out.error };
   return {
     path: out.path.map((p) => new THREE.Vector3(p.x, p.y, p.z)),
@@ -152,6 +157,8 @@ export interface RouteBreadcrumbsOptions {
   getOrigin?: () => THREE.Vector3;
   hideSphereMarkers?: boolean;
   hideBreadcrumbs?: boolean;
+  /** Tighten nav snap/path to one floor (2D map). */
+  floorSliceY?: number;
 }
 
 export interface RouteAndBreadcrumbsHandle {
@@ -201,7 +208,7 @@ export function createRouteAndBreadcrumbs(
     if (!options.getOrigin) origin.copy(originPt);
     originMarker.position.copy(originPt);
     destMarker.position.copy(destination);
-    const navOut = computeNavPath(getNavMeshFn(), originPt, destination);
+    const navOut = computeNavPath(getNavMeshFn(), originPt, destination, options.floorSliceY);
     if (!navOut.path || navOut.path.length < 2) {
       state.valid = false;
       state.error = navOut.error ?? 'No path';

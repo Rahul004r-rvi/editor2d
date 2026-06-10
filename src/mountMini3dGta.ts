@@ -28,6 +28,7 @@ import { createRouteAndBreadcrumbs, type RouteAndBreadcrumbsHandle } from './rou
 import {
   buildDemoPoisFromMap,
   fillRouteEndpointSelect,
+  filterPoisByFloorY,
   findNavMapPoi,
   getNavMapPois,
   setNavMapPois,
@@ -199,13 +200,14 @@ export function mountMini3dGta(
   sliceField.style.display = use2d ? 'flex' : 'none';
   const sliceLabel = document.createElement('span');
   sliceLabel.className = 'mini3dgta-fs-field__label';
-  sliceLabel.innerHTML = '<span>Floor height (Y)</span>';
+  sliceLabel.innerHTML = '<span>Floor slice (Y)</span>';
   const sliceInput = document.createElement('input');
   sliceInput.type = 'number';
   sliceInput.step = '0.1';
   sliceInput.value = String(floorSliceY);
   sliceInput.className = 'mini3dgta-fs-select';
-  sliceInput.title = 'Y-up slice — 2D map is top-down X–Z at this height';
+  sliceInput.title =
+    'Change Y to slice a height — draw/cut, then Add Floor. Click sidebar levels to switch back.';
   sliceField.append(sliceLabel, sliceInput);
 
   const mapCodeField = document.createElement('label');
@@ -235,11 +237,31 @@ export function mountMini3dGta(
   analyzeBtn.className = 'mini3dgta-fs-analyze';
   analyzeBtn.textContent = 'Structure Analyze';
 
-  const addBtn = document.createElement('button');
-  addBtn.type = 'button';
-  addBtn.className = 'mini3dgta-fs-tool';
-  addBtn.textContent = 'Add';
-  addBtn.title = 'Drag to add gray floor blocks';
+  const paintFloorBtn = document.createElement('button');
+  paintFloorBtn.type = 'button';
+  paintFloorBtn.className = 'mini3dgta-fs-tool';
+  paintFloorBtn.textContent = 'Paint Floor';
+  paintFloorBtn.title = 'Drag to add walkable floor at the current Y slice';
+
+  const floorBtn = document.createElement('button');
+  floorBtn.type = 'button';
+  floorBtn.className = 'mini3dgta-fs-tool';
+  floorBtn.textContent = 'Add Floor';
+  floorBtn.title = 'Save current Y as a new level (Floor 1, Floor 2, …)';
+
+  const renameFloorBtn = document.createElement('button');
+  renameFloorBtn.type = 'button';
+  renameFloorBtn.className = 'mini3dgta-fs-tool';
+  renameFloorBtn.textContent = 'Rename Floor';
+  renameFloorBtn.title = 'Rename the active floor level (e.g. Ground Floor)';
+  renameFloorBtn.disabled = true;
+
+  const deleteFloorBtn = document.createElement('button');
+  deleteFloorBtn.type = 'button';
+  deleteFloorBtn.className = 'mini3dgta-fs-tool mini3dgta-fs-tool--danger';
+  deleteFloorBtn.textContent = 'Delete Floor';
+  deleteFloorBtn.title = 'Delete the active floor level';
+  deleteFloorBtn.disabled = true;
 
   const cutBtn = document.createElement('button');
   cutBtn.type = 'button';
@@ -264,6 +286,14 @@ export function mountMini3dGta(
   editZoneBtn.className = 'mini3dgta-fs-tool';
   editZoneBtn.textContent = 'Edit Zone';
   editZoneBtn.title = 'Select zones and drag dots to move, resize, or reshape';
+
+  const deleteZoneBtn = document.createElement('button');
+  deleteZoneBtn.type = 'button';
+  deleteZoneBtn.className = 'mini3dgta-fs-tool mini3dgta-fs-tool--danger';
+  deleteZoneBtn.textContent = 'Delete Zone';
+  deleteZoneBtn.title = 'Delete the selected zone';
+  deleteZoneBtn.disabled = true;
+  deleteZoneBtn.style.display = 'none';
 
   const shapeBar = document.createElement('div');
   shapeBar.className = 'mini3dgta-fs-shapes';
@@ -311,7 +341,7 @@ export function mountMini3dGta(
   saveBtn.type = 'button';
   saveBtn.className = 'mini3dgta-fs-save';
   saveBtn.textContent = 'Save';
-  saveBtn.title = 'Save floor map + zones to database';
+  saveBtn.title = 'Save floor map, regions, and zones to database';
   saveBtn.disabled = true;
 
   const navMeshBtn = document.createElement('button');
@@ -327,11 +357,15 @@ export function mountMini3dGta(
 
   toolsBar.append(
     analyzeBtn,
-    addBtn,
+    paintFloorBtn,
+    floorBtn,
+    renameFloorBtn,
+    deleteFloorBtn,
     cutBtn,
     objectBtn,
     zoneBtn,
     editZoneBtn,
+    deleteZoneBtn,
     zoneShapeBar,
     shapeBar,
     undoBtn,
@@ -462,9 +496,30 @@ export function mountMini3dGta(
     return floor2dView?.getRouteZones() ?? [];
   }
 
+  function getRouteFloorsForSelect() {
+    return floor2dView?.getRouteFloors() ?? [];
+  }
+
+  /** POIs whose Y is nearest to the active floor (or current slice when previewing). */
+  function getPoisForActiveFloor(): ReturnType<typeof getNavMapPois> {
+    const all = getNavMapPois();
+    if (!use2d) return all;
+    const levels = floor2dView?.getFloorLevels() ?? [];
+    const active = floor2dView?.getActiveFloor();
+    const targetY = active?.floorY ?? floorSliceY;
+    return filterPoisByFloorY(all, targetY, levels);
+  }
+
+  function syncFloor2dPoiDisplay() {
+    if (!use2d || !floor2dView || !originSelect || !destSelect) return;
+    const pois = getPoisForActiveFloor();
+    floor2dView.setPois(pois, originSelect.value, destSelect.value);
+  }
+
   function updateMapOverlayPositions() {
     if (!mapOverlayLayer || fsOverlay?.style.display !== 'flex') return;
-    for (const poi of getNavMapPois()) {
+    const overlayPois = use2d ? getPoisForActiveFloor() : getNavMapPois();
+    for (const poi of overlayPois) {
       const label = poiLabelEls.get(poi.id);
       if (label) placeOverlayEl(label, poi.x, poi.y + 0.32, poi.z, 'label');
     }
@@ -490,7 +545,8 @@ export function mountMini3dGta(
     poiLabelEls.clear();
     originPinEl = null;
     destPinEl = null;
-    for (const poi of getNavMapPois()) {
+    const overlayPois = use2d ? getPoisForActiveFloor() : getNavMapPois();
+    for (const poi of overlayPois) {
       const label = document.createElement('span');
       label.className = 'mini3dgta-poi-label';
       label.textContent = poi.name;
@@ -515,49 +571,91 @@ export function mountMini3dGta(
 
   function refreshPoiSelects() {
     if (!originSelect || !destSelect) return;
-    const pois = getNavMapPois();
+    const pois = getPoisForActiveFloor();
     const zones = getRouteZonesForSelect();
+    const floors = getRouteFloorsForSelect();
     const o = originSelect.value;
     const d = destSelect.value;
-    fillRouteEndpointSelect(originSelect, 'Choose origin…', pois, zones, d || undefined, o);
-    fillRouteEndpointSelect(destSelect, 'Choose destination…', pois, zones, o || undefined, d);
+    fillRouteEndpointSelect(originSelect, 'Choose origin…', pois, zones, floors, d || undefined, o);
+    fillRouteEndpointSelect(destSelect, 'Choose destination…', pois, zones, floors, o || undefined, d);
+    syncFloor2dPoiDisplay();
+    applyPoiSelectionsFn?.();
   }
 
   function syncPoiSelectionsToRoute() {
     if (!originSelect || !destSelect) return;
-    const pois = getNavMapPois();
+    const pois = getPoisForActiveFloor();
     if (!originSelect.value && pois.length > 0) originSelect.value = pois[0].id;
     if (!destSelect.value && pois.length > 1) {
       const second = pois[1].id !== originSelect.value ? pois[1] : pois.length > 2 ? pois[2] : null;
       if (second) destSelect.value = second.id;
     }
     refreshPoiSelects();
-    applyPoiSelectionsFn?.();
   }
 
   function attachRoute() {
+    if (use2d) {
+      rebuildFloor2dRoute();
+      return;
+    }
     if (routeHandle) {
       scene.remove(routeHandle.group);
       routeHandle.dispose();
       routeHandle = null;
     }
-    routeHandle = createRouteAndBreadcrumbs(() => getNavMesh(), { hideSphereMarkers: true });
+    routeHandle = createRouteAndBreadcrumbs(() => getNavMesh(), {
+      hideSphereMarkers: true,
+    });
     syncPoiSelectionsToRoute();
     scene.add(routeHandle.group);
   }
+
+  function rebuildFloor2dRoute(): { valid: boolean; error: string | null } {
+    if (!use2d || !floor2dView || !originSelect || !destSelect) {
+      floor2dView?.setPath([]);
+      return { valid: false, error: null };
+    }
+    const o = originSelect.value ? resolveRouteEndpoint(originSelect.value) : null;
+    const d = destSelect.value ? resolveRouteEndpoint(destSelect.value) : null;
+    if (!o || !d) {
+      floor2dView.setPath([]);
+      syncFloor2dPoiDisplay();
+      return { valid: false, error: null };
+    }
+    const active = floor2dView.getActiveFloor();
+    const routeY = active?.floorY ?? floorSliceY;
+    const result = floor2dView.computeRoutePath(o.x, o.z, d.x, d.z, routeY);
+    floor2dView.setPath(result.path);
+    syncFloor2dPoiDisplay();
+    return { valid: result.path.length >= 2, error: result.error ?? null };
+  }
+
+  function updatePaintFloorTitle() {
+    paintFloorBtn.title = `Drag to paint walkable floor at Y = ${floorSliceY}`;
+  }
+  updatePaintFloorTitle();
 
   function ensureFloor2dView(): Floor2DView {
     if (!floor2dView) {
       floor2dView = new Floor2DView(mountRoot);
       floor2dView.setOnToolChange((tool: Floor2DTool) => {
         panBtn.classList.toggle('mini3dgta-fs-tool--active', tool === 'pan');
-        addBtn.classList.toggle('mini3dgta-fs-tool--active', tool === 'add');
+        paintFloorBtn.classList.toggle('mini3dgta-fs-tool--active', tool === 'add');
         cutBtn.classList.toggle('mini3dgta-fs-tool--active', tool === 'cut');
         objectBtn.classList.toggle('mini3dgta-fs-tool--active', tool === 'object');
         zoneBtn.classList.toggle('mini3dgta-fs-tool--active', tool === 'zone');
         editZoneBtn.classList.toggle('mini3dgta-fs-tool--active', tool === 'zone-edit');
         shapeBar.style.display = tool === 'object' ? 'inline-flex' : 'none';
         zoneShapeBar.style.display = tool === 'zone' ? 'inline-flex' : 'none';
+        deleteZoneBtn.style.display = tool === 'zone-edit' ? 'inline-block' : 'none';
+        if (tool !== 'zone-edit') deleteZoneBtn.disabled = true;
+        updatePaintFloorTitle();
+      });
+      floor2dView.setOnFloorActivate((floor) => {
+        switchToFloorLevel(floor.floorY, floor.id);
+      });
+      floor2dView.setOnZoneSelectionChange((zoneId) => {
+        deleteZoneBtn.disabled = !zoneId;
       });
       floor2dView.setOnDirtyChange(() => {
         saveBtn.disabled = !floor2dView?.hasMap() || saveInFlight;
@@ -567,6 +665,10 @@ export function mountMini3dGta(
         redoBtn.disabled = !canRedo;
       });
       floor2dView.setOnZonesChange(() => {
+        refreshPoiSelects();
+        applyPoiSelectionsFn?.();
+      });
+      floor2dView.setOnFloorsChange(() => {
         refreshPoiSelects();
         applyPoiSelectionsFn?.();
       });
@@ -582,30 +684,62 @@ export function mountMini3dGta(
     floor2dView.refreshNavMeshOverlay(getNavMesh(), floorSliceY);
   }
 
-  function show2dFloorFromMesh() {
+  function show2dFloorFromMesh(
+    options: {
+      preserveFloors?: boolean;
+      activeFloorId?: string | null;
+      forceLoadSaved?: boolean;
+    } = {},
+  ) {
     if (!use2d || mapRoot.children.length === 0) return;
     const view = ensureFloor2dView();
+    const hasMemoryFloors = view.getFloorLevels().length > 0;
+    const preserveFloors = options.preserveFloors ?? hasMemoryFloors;
+    if (preserveFloors && hasMemoryFloors) view.flushCurrentFloorState();
+
     const base = buildFloor2DFromMap(mapRoot, floorSliceY);
-    const map =
-      pendingFloorEdit?.floor_data && pendingFloorEdit.map_code === activeMapCode.trim().toUpperCase()
-        ? applySavedFloorEditToMap(base, pendingFloorEdit.floor_data)
-        : base;
-    view.setMap(map);
+    const savedEdit =
+      pendingFloorEdit?.floor_data &&
+      pendingFloorEdit.map_code === activeMapCode.trim().toUpperCase()
+        ? pendingFloorEdit
+        : null;
+    const shouldApplySaved =
+      savedEdit != null && (options.forceLoadSaved === true || !preserveFloors);
+    let map = shouldApplySaved
+      ? applySavedFloorEditToMap(base, savedEdit.floor_data)
+      : base;
+    if (preserveFloors && hasMemoryFloors) {
+      map = { ...map, floors: view.getFloorLevels() };
+    }
+    view.setMap(map, {
+      preserveFloors,
+      activeFloorId:
+        options.activeFloorId !== undefined ? options.activeFloorId : view.getActiveFloorId(),
+    });
+    deleteFloorBtn.disabled = !view.getActiveFloorId();
+    renameFloorBtn.disabled = !view.getActiveFloorId();
     refreshPoiSelects();
-    view.setPois(getNavMapPois(), originSelect?.value ?? '', destSelect?.value ?? '');
-    applyPoiSelectionsFn?.();
     saveBtn.disabled = saveInFlight;
     refreshNavMeshOverlay();
     syncFloor2dRouteFn?.();
   }
 
+  function switchToFloorLevel(floorY: number, activeFloorId: string | null) {
+    floorSliceY = floorY;
+    sliceInput.value = String(floorSliceY);
+    updatePaintFloorTitle();
+    pendingFloorEdit = null;
+    show2dFloorFromMesh({ preserveFloors: true, activeFloorId });
+  }
+
   async function loadFloorEditForProject(poiType: string, mapCode: string): Promise<void> {
+    floor2dView?.clearFloorLevels();
     pendingFloorEdit = await fetchNavmeFloorEdit(poiType, mapCode);
     if (pendingFloorEdit) {
       floorSliceY = pendingFloorEdit.floor_slice_y;
       sliceInput.value = String(floorSliceY);
       console.log(
-        `[Mini3dGta] Loaded floor edit for ${poiType} / ${mapCode} (slice Y=${floorSliceY}, ${pendingFloorEdit.floor_data.objects.length} objects, ${pendingFloorEdit.floor_data.zones.length} zones)`,
+        `[Mini3dGta] Loaded floor edit for ${poiType} / ${mapCode} (slice Y=${floorSliceY}, ${pendingFloorEdit.floor_data.objects.length} objects, ${pendingFloorEdit.floor_data.zones.length} zones, ${pendingFloorEdit.floor_data.floors.length} floors)`,
       );
     } else {
       console.log(`[Mini3dGta] No saved floor edit for ${poiType} / ${mapCode}`);
@@ -620,7 +754,7 @@ export function mountMini3dGta(
     try {
       await fetchAnalyzedFloorPlanFromMap(mapRoot, floorSliceY);
       if (gen !== floorAnalyzeGen) return;
-      show2dFloorFromMesh();
+      show2dFloorFromMesh({ preserveFloors: true, activeFloorId: floor2dView?.getActiveFloorId() ?? null });
       setNotify('Ready', 'Floor map ready — Add/Cut/Object, then Save', 'done');
     } catch (err) {
       setNotify('Analyze', err instanceof Error ? err.message : String(err), 'error');
@@ -631,12 +765,7 @@ export function mountMini3dGta(
 
   function syncFloor2dRoute() {
     if (!use2d || !floor2dView) return;
-    const pts = routeHandle?.state.pathPoints ?? [];
-    const pois = getNavMapPois();
-    const o = originSelect?.value ?? '';
-    const d = destSelect?.value ?? '';
-    floor2dView.setPath(pts);
-    floor2dView.setPois(pois, o, d);
+    rebuildFloor2dRoute();
   }
   syncFloor2dRouteFn = syncFloor2dRoute;
 
@@ -703,7 +832,9 @@ export function mountMini3dGta(
     await loadFloorEditForProject(poiType, activeMapCode);
     await refreshPoisForProject();
     if (reloadMapAfter) reloadMap();
-    else if (use2d && mapRoot.children.length > 0) show2dFloorFromMesh();
+    else if (use2d && mapRoot.children.length > 0) {
+      show2dFloorFromMesh({ forceLoadSaved: true });
+    }
   }
 
   projectReady = (async () => {
@@ -776,13 +907,38 @@ export function mountMini3dGta(
         await refreshPoisForProject();
         rebuildMapOverlay();
         if (use2d) {
-          show2dFloorFromMesh();
+          show2dFloorFromMesh({ forceLoadSaved: true });
         }
         setNotify('Ready', use2d ? '2D floor map — Add/Cut/Object, then Save' : 'Map visible — preparing navigation…', 'done');
         await yieldToBrowser();
         if (!use2d) requestAnimationFrame(() => applyMapTransparentGhostMaterial(gltf.scene));
 
         const finishNavAndRoute = async () => {
+          if (use2d) {
+            attachRoute();
+            const route = rebuildFloor2dRoute();
+            const hasRouteEndpoints = Boolean(originSelect?.value && destSelect?.value);
+            if (hasRouteEndpoints && !route.valid) {
+              setNotify('Path', route.error || 'Could not build path on floor', 'error');
+              return;
+            }
+            setNotify('Ready', '2D floor navigation ready', 'done');
+            void (async () => {
+              navMeshBuilding = true;
+              navMeshBtn.disabled = true;
+              try {
+                await ensureNavMeshForMap(mapRoot);
+                refreshNavMeshOverlay();
+              } catch (err) {
+                console.warn('[navmesh] overlay build failed:', err);
+              } finally {
+                navMeshBuilding = false;
+                navMeshBtn.disabled = false;
+              }
+            })();
+            return;
+          }
+
           navMeshBuilding = true;
           navMeshBtn.disabled = true;
           setNotify('Nav mesh', 'Building walkable nav mesh…', 'loading');
@@ -865,26 +1021,56 @@ export function mountMini3dGta(
   closeBtn.addEventListener('click', () => setFullscreenOpen(false));
 
   applyPoiSelectionsFn = () => {
-    if (!routeHandle || !originSelect || !destSelect) return;
-    const o = originSelect.value ? resolveRouteEndpoint(originSelect.value) : null;
-    const d = destSelect.value ? resolveRouteEndpoint(destSelect.value) : null;
-    if (o) routeHandle.setOrigin(o.x, o.y, o.z);
-    if (d) routeHandle.setDestination(d.x, d.y, d.z);
+    if (!originSelect || !destSelect) return;
+    if (use2d) {
+      rebuildFloor2dRoute();
+    } else if (routeHandle) {
+      const o = originSelect.value ? resolveRouteEndpoint(originSelect.value) : null;
+      const d = destSelect.value ? resolveRouteEndpoint(destSelect.value) : null;
+      if (o) routeHandle.setOrigin(o.x, o.y, o.z);
+      if (d) routeHandle.setDestination(d.x, d.y, d.z);
+    }
     rebuildMapOverlayFn?.();
     syncFloor2dRouteFn?.();
   };
 
   const scheduleSliceRebuild = () => {
     if (sliceDebounceTimer) clearTimeout(sliceDebounceTimer);
-    sliceDebounceTimer = setTimeout(() => show2dFloorFromMesh(), 450);
+    sliceDebounceTimer = setTimeout(
+      () =>
+        show2dFloorFromMesh({
+          preserveFloors: true,
+          activeFloorId: floor2dView?.getActiveFloorId() ?? null,
+        }),
+      450,
+    );
   };
 
   analyzeBtn.addEventListener('click', () => void runStructureAnalyze());
-  addBtn.addEventListener('click', () => ensureFloor2dView().setTool('add'));
+  paintFloorBtn.addEventListener('click', () => ensureFloor2dView().setTool('add'));
+  floorBtn.addEventListener('click', () => {
+    const view = ensureFloor2dView();
+    const floor = view.addFloorLevel(floorSliceY);
+    switchToFloorLevel(floor.floorY, floor.id);
+  });
+  renameFloorBtn.addEventListener('click', () => {
+    void ensureFloor2dView().renameActiveFloor();
+  });
+  deleteFloorBtn.addEventListener('click', () => {
+    if (floor2dView?.deleteActiveFloor()) {
+      const active = floor2dView.getActiveFloor();
+      if (active) switchToFloorLevel(active.floorY, active.id);
+      else show2dFloorFromMesh({ preserveFloors: true, activeFloorId: null });
+      deleteFloorBtn.disabled = !floor2dView.getActiveFloorId();
+    }
+  });
   cutBtn.addEventListener('click', () => ensureFloor2dView().setTool('cut'));
   objectBtn.addEventListener('click', () => ensureFloor2dView().setTool('object'));
   zoneBtn.addEventListener('click', () => ensureFloor2dView().setTool('zone'));
   editZoneBtn.addEventListener('click', () => ensureFloor2dView().setTool('zone-edit'));
+  deleteZoneBtn.addEventListener('click', () => {
+    floor2dView?.deleteSelectedZone();
+  });
   const setZoneDrawMode = (mode: ZoneDrawMode) => {
     const view = ensureFloor2dView();
     view.setZoneDrawMode(mode);
@@ -944,6 +1130,7 @@ export function mountMini3dGta(
         state.walk,
         state.objects,
         state.zones,
+        state.floors,
       );
       saveInFlight = false;
       saveBtn.disabled = !view.hasMap();
@@ -956,7 +1143,7 @@ export function mountMini3dGta(
         };
         setNotify(
           'Saved',
-          `Floor map saved (${payload.objects.length} object(s), ${payload.zones.length} zone(s), Y=${floorSliceY})`,
+          `Floor map saved (${payload.objects.length} object(s), ${payload.floors.length} floor(s), ${payload.zones.length} zone(s), Y=${floorSliceY})`,
           'done',
         );
       } else {
@@ -974,13 +1161,33 @@ export function mountMini3dGta(
   };
   window.addEventListener('keydown', onFloorEditKeydown);
 
-  sliceInput.addEventListener('change', () => {
-    const v = parseFloat(sliceInput.value);
-    if (!Number.isFinite(v)) return;
-    floorSliceY = v;
+  function applySliceYChange(newY: number) {
+    if (!Number.isFinite(newY)) return;
+    const view = floor2dView;
+    const prevY = floorSliceY;
+    const active = view?.getActiveFloor();
+    if (view && active && Math.abs(active.floorY - prevY) < 1e-4) {
+      view.flushCurrentFloorState();
+    }
+    floorSliceY = newY;
+    sliceInput.value = String(floorSliceY);
+    updatePaintFloorTitle();
     pendingFloorEdit = null;
-    scheduleSliceRebuild();
+
+    const existing = view?.getFloorLevels().find((f) => Math.abs(f.floorY - newY) < 1e-4);
+    if (existing) {
+      switchToFloorLevel(existing.floorY, existing.id);
+      return;
+    }
+
+    view?.clearActiveFloor();
+    if (sliceDebounceTimer) clearTimeout(sliceDebounceTimer);
+    show2dFloorFromMesh({ preserveFloors: true, activeFloorId: null });
     refreshNavMeshOverlay();
+  }
+
+  sliceInput.addEventListener('change', () => {
+    applySliceYChange(parseFloat(sliceInput.value));
   });
 
   originSelect.addEventListener('change', () => {

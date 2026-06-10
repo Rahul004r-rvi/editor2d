@@ -75,6 +75,9 @@ export function injectMini3dGtaUiStyles(): void {
 .mini3dgta-fs-analyze:disabled,.mini3dgta-fs-tool:disabled{opacity:.45;cursor:not-allowed;color:#9e9e9e}
 .mini3dgta-fs-tool--active{background:#9c27b0;color:#fff}
 .mini3dgta-fs-tool--active:hover{background:#7b1fa2}
+.mini3dgta-fs-tool--danger{background:#ffebee;color:#c62828}
+.mini3dgta-fs-tool--danger:hover:not(:disabled){background:#ffcdd2}
+.mini3dgta-fs-tool--danger:disabled{opacity:.45;cursor:not-allowed;color:#9e9e9e;background:#f5f5f5}
 .mini3dgta-fs-save{background:#4caf50;color:#fff}
 .mini3dgta-fs-save:hover:not(:disabled){background:#43a047}
 .mini3dgta-fs-save:disabled{opacity:.45;cursor:not-allowed;background:#e0e0e0;color:#9e9e9e}
@@ -94,6 +97,10 @@ export function injectMini3dGtaUiStyles(): void {
 .floor2d-zone-sidebar__header{
   padding:12px 14px 6px;font-size:12px;font-weight:700;letter-spacing:.04em;
   text-transform:uppercase;color:#616161}
+.floor2d-zone-sidebar__header--zones{
+  padding-top:14px;border-top:1px solid #eeeeee;margin-top:4px}
+.floor2d-floor-list{margin-bottom:4px}
+.floor2d-zone-item--floor-active{background:#e3f2fd;border-color:#90caf9}
 .floor2d-zone-sidebar__hint{
   padding:0 14px 10px;font-size:11px;line-height:1.35;color:#9e9e9e}
 .floor2d-zone-list{flex:1;overflow-y:auto;padding:6px 8px 12px}

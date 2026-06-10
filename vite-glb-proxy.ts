@@ -3,7 +3,8 @@ import type { Connect, Plugin } from 'vite';
 /** Streams large GLB downloads in dev — avoids Supabase edge WORKER_RESOURCE_LIMIT (546). */
 export function glbStreamProxyPlugin(): Plugin {
   const handler: Connect.NextHandleFunction = (req, res, next) => {
-    if (req.url !== '/api/proxy-external-fetch' || req.method !== 'POST') {
+    const path = (req.url ?? '').split('?')[0];
+    if (path !== '/api/proxy-external-fetch' || req.method !== 'POST') {
       next();
       return;
     }
