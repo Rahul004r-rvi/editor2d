@@ -26,6 +26,7 @@ import {
   type FloorShape,
 } from './floor2d';
 import { findPathOnFloorGrid } from './floor2dRoute';
+import { Floor2DScene3d } from './floor2dScene3d';
 import { extractNavMeshSlice2D, type NavMeshSliceTri } from './navmesh2d';
 import {
   boundsFromPoints,
@@ -78,6 +79,8 @@ function truncateLabel(text: string, maxLen: number): string {
 
 export class Floor2DView {
   readonly canvas: HTMLCanvasElement;
+  private scene3d: Floor2DScene3d | null = null;
+  private iso3d = false;
   private map: Floor2DMap | null = null;
   private editWalk: Uint8Array | null = null;
   private editObjects: FloorBlock[] = [];
@@ -140,9 +143,49 @@ export class Floor2DView {
       FLOOR2D_STYLE.background +
       ';position:relative;z-index:1;';
     parent.appendChild(this.canvas);
+    this.scene3d = new Floor2DScene3d(parent);
     this.buildZoneNameDialog(parent);
     this.bindPointer();
     this.bindKeyboard();
+  }
+
+  isIso3d(): boolean {
+    return this.iso3d;
+  }
+
+  /** Toggle extruded 3D walls with orbit / tilt (drag to rotate view). */
+  toggleIso3d(): boolean {
+    this.iso3d = !this.iso3d;
+    this.scene3d?.setVisible(this.iso3d);
+    this.canvas.style.display = this.iso3d ? 'none' : 'block';
+    if (this.iso3d) {
+      this.syncScene3d(true);
+    } else {
+      this.draw();
+    }
+    return this.iso3d;
+  }
+
+  setIso3d(on: boolean): void {
+    if (on === this.iso3d) return;
+    this.toggleIso3d();
+  }
+
+  private syncScene3d(refitCamera = false): void {
+    if (!this.iso3d || !this.scene3d || !this.map || !this.editWalk) return;
+    const preview = this.previewMap();
+    if (!preview) return;
+    this.scene3d.sync({
+      map: preview,
+      walk: this.editWalk,
+      objects: this.editObjects,
+      zones: this.editZones,
+      stores: preview.stores,
+      path: this.path,
+      pois: this.pois,
+      originId: this.originId,
+      destId: this.destId,
+    }, refitCamera);
   }
 
   private buildZoneSidebar(mapParent: HTMLElement): void {
@@ -905,6 +948,7 @@ export class Floor2DView {
     this.canvas.height = Math.floor(h * dpr);
     this.canvas.style.width = w + 'px';
     this.canvas.style.height = h + 'px';
+    this.scene3d?.resize(w, h);
     this.draw();
   }
 
@@ -1451,27 +1495,20 @@ export class Floor2DView {
   }
 
   private drawPolygonDraft(ctx: CanvasRenderingContext2D, dpr: number): void {
-    ctx.save();
-    ctx.globalAlpha = FLOOR2D_STYLE.zoneStrokeOpacity;
     this.drawRegionPolygonDraft(ctx, dpr, this.polygonDraft, FLOOR2D_STYLE.accent);
-    ctx.restore();
   }
 
   private drawZones(ctx: CanvasRenderingContext2D, dpr: number): void {
     const lineW = Math.max(2, 2.5 * dpr);
-    const zoneAlpha = FLOOR2D_STYLE.zoneStrokeOpacity;
     for (const b of this.editZones) {
       const stroke = b.stroke || FLOOR2D_STYLE.accent;
       const selected = b.id === this.selectedZoneId;
-      ctx.save();
-      ctx.globalAlpha = selected ? Math.min(1, zoneAlpha + 0.18) : zoneAlpha;
       this.drawZoneOutline(ctx, b, stroke, lineW, true, selected);
       const x = this.wx(b.x);
       const y = this.wz(b.z);
       const w = b.w * this.scale;
       const h = b.d * this.scale;
       this.drawZoneLabel(ctx, x, y, w, h, b.label, dpr, stroke);
-      ctx.restore();
       if (selected && this.isZoneEditTool()) this.drawZoneHandles(ctx, b, dpr);
     }
   }
@@ -1481,7 +1518,6 @@ export class Floor2DView {
     ctx.lineWidth = lineW;
     ctx.strokeStyle = FLOOR2D_STYLE.wallLight;
     ctx.fillStyle = FLOOR2D_STYLE.store;
-    ctx.globalAlpha = 0.88;
     for (const b of m.stores) {
       const x = this.wx(b.x);
       const y = this.wz(b.z);
@@ -1491,7 +1527,6 @@ export class Floor2DView {
       ctx.strokeRect(x + lineW * 0.5, y + lineW * 0.5, w - lineW, h - lineW);
       this.drawZoneLabel(ctx, x, y, w, h, zoneDisplayLabel(b, this.pois), dpr, FLOOR2D_STYLE.zoneLabel);
     }
-    ctx.globalAlpha = 1;
   }
 
   private drawWalls(ctx: CanvasRenderingContext2D, m: Floor2DMap, dpr: number): void {
@@ -1558,8 +1593,8 @@ export class Floor2DView {
 
   private drawRoute(ctx: CanvasRenderingContext2D, dpr: number): void {
     if (this.path.length < 2) return;
-    const lw = Math.max(4, 5 * dpr);
-    const outline = lw + 2.5 * dpr;
+    const lw = Math.max(7, 8 * dpr);
+    const outline = lw + 3.5 * dpr;
     ctx.lineJoin = 'round';
     ctx.lineCap = 'round';
     ctx.beginPath();
@@ -1656,9 +1691,12 @@ export class Floor2DView {
     this.drawDraft(ctx, dpr);
     this.drawRoute(ctx, dpr);
     this.drawPois(ctx, dpr);
+    if (this.iso3d) this.syncScene3d();
   }
 
   dispose(): void {
+    this.scene3d?.dispose();
+    this.scene3d = null;
     this.zoneDialog?.remove();
     this.zoneSidebar?.remove();
     this.zoneDialog = null;

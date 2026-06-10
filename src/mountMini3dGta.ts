@@ -355,6 +355,12 @@ export function mountMini3dGta(
   panBtn.className = 'mini3dgta-fs-tool mini3dgta-fs-tool--active';
   panBtn.textContent = 'Pan';
 
+  const walls3dBtn = document.createElement('button');
+  walls3dBtn.type = 'button';
+  walls3dBtn.className = 'mini3dgta-fs-tool';
+  walls3dBtn.textContent = '3D Walls';
+  walls3dBtn.title = 'Extruded walls — left-drag orbit, right-drag pan, scroll zoom';
+
   toolsBar.append(
     analyzeBtn,
     paintFloorBtn,
@@ -373,6 +379,7 @@ export function mountMini3dGta(
     saveBtn,
     navMeshBtn,
     panBtn,
+    walls3dBtn,
   );
 
   const closeBtn = document.createElement('button');
@@ -1108,6 +1115,15 @@ export function mountMini3dGta(
   undoBtn.addEventListener('click', () => floor2dView?.undo());
   redoBtn.addEventListener('click', () => floor2dView?.redo());
   panBtn.addEventListener('click', () => ensureFloor2dView().setTool('pan'));
+  walls3dBtn.addEventListener('click', () => {
+    const view = ensureFloor2dView();
+    const on = view.toggleIso3d();
+    walls3dBtn.classList.toggle('mini3dgta-fs-tool--active', on);
+    if (on) {
+      view.setTool('pan');
+      panBtn.classList.add('mini3dgta-fs-tool--active');
+    }
+  });
   saveBtn.addEventListener('click', () => {
     void (async () => {
       const view = floor2dView;
