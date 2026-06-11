@@ -71,7 +71,7 @@ export function nearestWalkableCell(
   nav: Uint8Array,
   x: number,
   z: number,
-  maxCells = 48,
+  maxCells = 128,
 ): Cell | null {
   const start = worldToCell(map, x, z);
   if (!start) return null;
@@ -103,6 +103,19 @@ export function nearestWalkableCell(
     }
   }
   return null;
+}
+
+export function snapWorldToWalkCell(
+  map: Floor2DMap,
+  walk: Uint8Array,
+  objects: FloorBlock[],
+  x: number,
+  z: number,
+): { x: number; z: number } | null {
+  const nav = buildFloorNavGrid(map, walk, objects);
+  const cell = nearestWalkableCell(map, nav, x, z);
+  if (!cell) return null;
+  return cellCenter(map, cell.c, cell.r);
 }
 
 function heuristic(a: Cell, b: Cell): number {

@@ -1,7 +1,8 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import type { Floor2DMap, FloorBlock, WallSeg } from './floor2d';
-import type { NavMapPoi } from './pois';
+import type { FloorRouteConnector } from './floor2dMultiRoute';
+import { nearestFloorYForPoi, type NavMapPoi } from './pois';
 import { isPolygonZone, zoneCentroid } from './zoneGeometry';
 
 /** Mappedin-style 3D floor palette (reference: soft white plan on gray canvas). */
@@ -36,9 +37,17 @@ const BORDER_WALL_THICKNESS = 0.09;
 const INTERIOR_WALL_THICKNESS = 0.08;
 const MIN_INTERIOR_VOID_CELLS = 2;
 const FLOOR_THICKNESS = 0.06;
+const PLATE_THICKNESS = 0.14;
 const ROUTE_LIFT = 0.12;
-const ROUTE_RADIUS = 0.15;
+const ROUTE_RADIUS = 0.17;
 const WALL_EPS = 1e-4;
+/** Vertical spacing between stacked floor plates (world units) — not the full map span. */
+const STACK_PLATE_STEP = 2.85;
+/** Shorter extruded walls on stacked plates so levels stay visually separated. */
+const STACK_BORDER_WALL_HEIGHT = 0.92;
+const STACK_INTERIOR_WALL_HEIGHT = 0.36;
+const STACK_INTERIOR_BLOCK_HEIGHT = 0.3;
+const PLAN_LINE_LIFT = 0.038;
 
 function hex(color: string): THREE.Color {
   return new THREE.Color(color);
@@ -135,18 +144,23 @@ function shadedWallMat(color: string, roughness = 0.9): THREE.MeshStandardMateri
   });
 }
 
+type WallHeights = { border: number; interior: number };
+
 function addWallSegment(
   group: THREE.Group,
   seg: WallSeg,
   floorY: number,
   border: boolean,
+  heights?: WallHeights,
 ): void {
   const dx = seg.x2 - seg.x1;
   const dz = seg.z2 - seg.z1;
   const len = Math.hypot(dx, dz);
   if (len < WALL_EPS) return;
 
-  const height = border ? BORDER_WALL_HEIGHT : INTERIOR_WALL_HEIGHT;
+  const height = border
+    ? (heights?.border ?? BORDER_WALL_HEIGHT)
+    : (heights?.interior ?? INTERIOR_WALL_HEIGHT);
   const thickness = border ? BORDER_WALL_THICKNESS : INTERIOR_WALL_THICKNESS;
   const rotY = Math.atan2(dz, dx);
   const cx = (seg.x1 + seg.x2) / 2;
@@ -249,6 +263,8 @@ function addEnclosedInteriorVolumes(
   map: Floor2DMap,
   walk: Uint8Array,
   floorY: number,
+  blockHeight = INTERIOR_BLOCK_HEIGHT,
+  wallHeight = INTERIOR_WALL_HEIGHT,
 ): void {
   const enclosed = markEnclosedVoidCells(map, walk);
   const used = new Uint8Array(map.cols * map.rows);
@@ -289,21 +305,21 @@ function addEnclosedInteriorVolumes(
       const inset = 0.04;
 
       const body = new THREE.Mesh(
-        new THREE.BoxGeometry(boxW - inset, INTERIOR_BLOCK_HEIGHT, boxD - inset),
+        new THREE.BoxGeometry(boxW - inset, blockHeight, boxD - inset),
         bodyMat,
       );
-      body.position.set(cx, floorY + INTERIOR_BLOCK_HEIGHT / 2, cz);
+      body.position.set(cx, floorY + blockHeight / 2, cz);
       body.castShadow = true;
       body.receiveShadow = true;
       group.add(body);
 
-      const rimH = INTERIOR_WALL_HEIGHT - INTERIOR_BLOCK_HEIGHT;
+      const rimH = wallHeight - blockHeight;
       if (rimH > 0.02) {
         const rim = new THREE.Mesh(
           new THREE.BoxGeometry(boxW - inset * 0.5, rimH, boxD - inset * 0.5),
           sideMat,
         );
-        rim.position.set(cx, floorY + INTERIOR_BLOCK_HEIGHT + rimH / 2, cz);
+        rim.position.set(cx, floorY + blockHeight + rimH / 2, cz);
         rim.castShadow = true;
         group.add(rim);
       }
@@ -312,7 +328,7 @@ function addEnclosedInteriorVolumes(
         new THREE.BoxGeometry(boxW - inset * 0.3, 0.028, boxD - inset * 0.3),
         topMat,
       );
-      top.position.set(cx, floorY + INTERIOR_WALL_HEIGHT + 0.014, cz);
+      top.position.set(cx, floorY + wallHeight + 0.014, cz);
       group.add(top);
     }
   }
@@ -324,26 +340,185 @@ function addWallMeshes(
   map: Floor2DMap,
   walk: Uint8Array,
   floorY: number,
+  stacked = false,
 ): void {
+  const heights: WallHeights | undefined = stacked
+    ? { border: STACK_BORDER_WALL_HEIGHT, interior: STACK_INTERIOR_WALL_HEIGHT }
+    : undefined;
   for (const seg of walls) {
-    addWallSegment(group, seg, floorY, isBorderWallSegment(seg, map, walk));
+    addWallSegment(group, seg, floorY, isBorderWallSegment(seg, map, walk), heights);
   }
 }
 
-function addBaseFloor(group: THREE.Group, map: Floor2DMap, floorY: number): void {
+/** Flat 2D-style wall lines on the plate (no extrusion). */
+function addWallPlanLines(group: THREE.Group, walls: WallSeg[], floorY: number): void {
+  if (walls.length === 0) return;
+  const y = floorY + PLAN_LINE_LIFT;
+  const positions: number[] = [];
+  for (const seg of walls) {
+    positions.push(seg.x1, y, seg.z1, seg.x2, y, seg.z2);
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  const lines = new THREE.LineSegments(
+    geo,
+    new THREE.LineBasicMaterial({ color: hex('#8a8a8a') }),
+  );
+  lines.renderOrder = 6;
+  group.add(lines);
+}
+
+function addStorePlanRects(group: THREE.Group, stores: FloorBlock[], floorY: number): void {
+  if (stores.length === 0) return;
+  const y = floorY + PLAN_LINE_LIFT - 0.004;
+  const fillMat = new THREE.MeshBasicMaterial({
+    color: hex('#ffffff'),
+    transparent: true,
+    opacity: 0.92,
+    depthWrite: false,
+  });
+  const edgeMat = new THREE.LineBasicMaterial({ color: hex('#b8b4ac') });
+  for (const s of stores) {
+    const mesh = new THREE.Mesh(new THREE.PlaneGeometry(s.w, s.d), fillMat);
+    mesh.rotation.x = -Math.PI / 2;
+    mesh.position.set(s.x + s.w / 2, y, s.z + s.d / 2);
+    mesh.renderOrder = 4;
+    group.add(mesh);
+    const pts = [
+      new THREE.Vector3(s.x, y, s.z),
+      new THREE.Vector3(s.x + s.w, y, s.z),
+      new THREE.Vector3(s.x + s.w, y, s.z + s.d),
+      new THREE.Vector3(s.x, y, s.z + s.d),
+    ];
+    const loop = new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(pts), edgeMat);
+    loop.renderOrder = 5;
+    group.add(loop);
+  }
+}
+
+function zoneOutlinePoints(zone: FloorBlock, y: number): THREE.Vector3[] {
+  if (isPolygonZone(zone) && zone.points && zone.points.length >= 3) {
+    return zone.points.map((p) => new THREE.Vector3(p.x, y, p.z));
+  }
+  return [
+    new THREE.Vector3(zone.x, y, zone.z),
+    new THREE.Vector3(zone.x + zone.w, y, zone.z),
+    new THREE.Vector3(zone.x + zone.w, y, zone.z + zone.d),
+    new THREE.Vector3(zone.x, y, zone.z + zone.d),
+  ];
+}
+
+/** Dashed zone borders like the 2D floor plan. */
+function addZonePlanOutlines(group: THREE.Group, zones: FloorBlock[], floorY: number): void {
+  const y = floorY + PLAN_LINE_LIFT + 0.006;
+  for (const zone of zones) {
+    const stroke = zone.stroke || STYLE.zoneTints[0];
+    const pts = zoneOutlinePoints(zone, y);
+    const geo = new THREE.BufferGeometry().setFromPoints(pts);
+    const mat = new THREE.LineDashedMaterial({
+      color: hex(stroke),
+      dashSize: 0.28,
+      gapSize: 0.18,
+    });
+    const loop = new THREE.LineLoop(geo, mat);
+    loop.computeLineDistances();
+    loop.renderOrder = 7;
+    group.add(loop);
+  }
+}
+
+function addObjectPlanRects(group: THREE.Group, objects: FloorBlock[], floorY: number): void {
+  if (objects.length === 0) return;
+  const y = floorY + PLAN_LINE_LIFT;
+  const mat = new THREE.LineBasicMaterial({ color: hex('#b8b4ac') });
+  for (const o of objects) {
+    const pts = [
+      new THREE.Vector3(o.x, y, o.z),
+      new THREE.Vector3(o.x + o.w, y, o.z),
+      new THREE.Vector3(o.x + o.w, y, o.z + o.d),
+      new THREE.Vector3(o.x, y, o.z + o.d),
+    ];
+    const loop = new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(pts), mat);
+    loop.renderOrder = 5;
+    group.add(loop);
+  }
+}
+
+function addFloorPlanDrawings(
+  group: THREE.Group,
+  map: Floor2DMap,
+  zones: FloorBlock[],
+  objects: FloorBlock[],
+  floorY: number,
+): void {
+  addWallPlanLines(group, map.walls, floorY);
+  addStorePlanRects(group, map.stores, floorY);
+  addZonePlanOutlines(group, zones, floorY);
+  addObjectPlanRects(group, objects, floorY);
+}
+
+/** Horizontal floor plate (PlaneGeometry rotated −90° on X → lies on XZ at floorY). */
+function addFloorPlate(group: THREE.Group, map: Floor2DMap, floorY: number, multi = false): void {
   const w = map.maxX - map.minX;
   const d = map.maxZ - map.minZ;
-  const slab = new THREE.Mesh(
-    new THREE.BoxGeometry(w, FLOOR_THICKNESS, d),
+  const cx = (map.minX + map.maxX) / 2;
+  const cz = (map.minZ + map.maxZ) / 2;
+
+  const planeGeo = new THREE.PlaneGeometry(w, d);
+  planeGeo.rotateX(-Math.PI / 2);
+  const top = new THREE.Mesh(
+    planeGeo,
     new THREE.MeshStandardMaterial({
-      color: hex(STYLE.floor),
-      roughness: 0.96,
+      color: hex(multi ? '#f8fafc' : STYLE.floor),
+      roughness: 0.94,
       metalness: 0,
+      side: THREE.DoubleSide,
     }),
   );
-  slab.position.set((map.minX + map.maxX) / 2, floorY - FLOOR_THICKNESS / 2, (map.minZ + map.maxZ) / 2);
-  slab.receiveShadow = true;
-  group.add(slab);
+  top.position.set(cx, floorY + 0.002, cz);
+  top.receiveShadow = true;
+  group.add(top);
+
+  const edge = new THREE.Mesh(
+    new THREE.BoxGeometry(w, multi ? PLATE_THICKNESS : FLOOR_THICKNESS, d),
+    shadedWallMat(multi ? '#cbd5e1' : STYLE.floor, 0.92),
+  );
+  edge.position.set(cx, floorY - (multi ? PLATE_THICKNESS : FLOOR_THICKNESS) / 2, cz);
+  edge.receiveShadow = true;
+  group.add(edge);
+}
+
+function addBaseFloor(group: THREE.Group, map: Floor2DMap, floorY: number): void {
+  addFloorPlate(group, map, floorY, false);
+}
+
+function makeFloorLabelSprite(label: string): THREE.Sprite {
+  const text = (label.trim() || 'Floor').slice(0, 24);
+  const canvas = document.createElement('canvas');
+  const ctx = canvas.getContext('2d')!;
+  const fontSize = 20;
+  ctx.font = `700 ${fontSize}px system-ui, -apple-system, sans-serif`;
+  const textW = ctx.measureText(text).width;
+  const w = Math.ceil(textW + 24);
+  const h = 36;
+  canvas.width = w;
+  canvas.height = h;
+  ctx.fillStyle = 'rgba(255,255,255,0.92)';
+  ctx.fillRect(4, 4, w - 8, h - 8);
+  ctx.strokeStyle = '#94a3b8';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(4.5, 4.5, w - 9, h - 9);
+  ctx.fillStyle = '#1e293b';
+  ctx.font = `700 ${fontSize}px system-ui, -apple-system, sans-serif`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text, w / 2, h / 2);
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.needsUpdate = true;
+  const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false });
+  const sprite = new THREE.Sprite(mat);
+  sprite.scale.set(w * 0.0065, h * 0.0065, 1);
+  return sprite;
 }
 
 function zoneTint(zone: FloorBlock, index: number): THREE.Color {
@@ -506,8 +681,24 @@ function addObjectBlocks(group: THREE.Group, objects: FloorBlock[], floorY: numb
   }
 }
 
+export type Floor2DScene3dFloorLayer = {
+  floorId: string;
+  label: string;
+  floorY: number;
+  map: Floor2DMap;
+  walk: Uint8Array;
+  objects: FloorBlock[];
+  zones: FloorBlock[];
+  path: { x: number; z: number }[];
+  pois?: NavMapPoi[];
+};
+
 export type Floor2DScene3dSync = {
   map: Floor2DMap;
+  multiFloor?: boolean;
+  floors?: Floor2DScene3dFloorLayer[];
+  connectors?: FloorRouteConnector[];
+  floorLevels?: { floorY: number }[];
   walk: Uint8Array;
   objects: FloorBlock[];
   zones: FloorBlock[];
@@ -516,6 +707,15 @@ export type Floor2DScene3dSync = {
   pois: NavMapPoi[];
   originId: string;
   destId: string;
+  /** Multi-floor route view: orbitable vertical stack without wall meshes. */
+  verticalPlateStack?: boolean;
+  showWalls?: boolean;
+  showInteriorVolumes?: boolean;
+  showObjects?: boolean;
+};
+
+type FloorDisplayLayer = Floor2DScene3dFloorLayer & {
+  displayY: number;
 };
 
 /** Mappedin-style 3D floor — soft plan, tall border walls, low interior partitions, zone fills. */
@@ -596,10 +796,15 @@ export class Floor2DScene3d {
   }
 
   sync(data: Floor2DScene3dSync, refitCamera = false): void {
-    const { map, walk } = data;
     disposeObject3D(this.content);
     this.content.clear();
 
+    if (data.multiFloor && data.floors && data.floors.length > 0) {
+      this.syncMultiFloor(data, refitCamera);
+      return;
+    }
+
+    const { map, walk } = data;
     const floorY = map.sliceY;
     addBaseFloor(this.content, map, floorY);
     addWalkCorridorTint(this.content, map, walk, floorY);
@@ -607,21 +812,99 @@ export class Floor2DScene3d {
     addZoneLabelsAndFills(this.content, data.zones, floorY);
     addObjectBlocks(this.content, data.objects, floorY);
     addWallMeshes(this.content, map.walls, map, walk, floorY);
-    this.addRoute(data.path, floorY);
+    this.addRoutePath(data.path, floorY);
     this.addPois(data.pois, data.originId, data.destId, floorY);
     if (refitCamera) this.fitCamera(map);
   }
 
-  private addRoute(path: { x: number; z: number }[], floorY: number): void {
-    if (path.length < 2) return;
-    const y = floorY + ROUTE_LIFT;
+  private syncMultiFloor(data: Floor2DScene3dSync, refitCamera: boolean): void {
+    const floorLevels = data.floorLevels ?? data.floors!.map((f) => ({ floorY: f.floorY }));
+    const sorted = [...data.floors!].sort((a, b) => a.floorY - b.floorY);
+    const verticalStack = data.verticalPlateStack ?? false;
+    const showWalls = data.showWalls ?? !verticalStack;
+    const showInterior = data.showInteriorVolumes ?? showWalls;
+    const showObjects = data.showObjects ?? showWalls;
+    const map = data.map;
+
+    const displayLayers: FloorDisplayLayer[] = sorted.map((layer, i) => ({
+      ...layer,
+      displayY: verticalStack ? i * STACK_PLATE_STEP : layer.floorY,
+    }));
+
+    for (const layer of displayLayers) {
+      const plate = new THREE.Group();
+      const { walk } = layer;
+      const floorMap = layer.map;
+      const y = layer.displayY;
+      const walkForMesh =
+        walk.length === floorMap.cols * floorMap.rows
+          ? walk
+          : new Uint8Array(floorMap.cols * floorMap.rows);
+
+      addFloorPlate(plate, floorMap, y, true);
+      if (walk.length > 0) {
+        addWalkCorridorTint(plate, floorMap, walk, y);
+      }
+      if (showInterior && walk.length > 0) {
+        addEnclosedInteriorVolumes(
+          plate,
+          floorMap,
+          walk,
+          y,
+          verticalStack ? STACK_INTERIOR_BLOCK_HEIGHT : INTERIOR_BLOCK_HEIGHT,
+          verticalStack ? STACK_INTERIOR_WALL_HEIGHT : INTERIOR_WALL_HEIGHT,
+        );
+      }
+      if (showWalls) {
+        addWallMeshes(plate, floorMap.walls, floorMap, walkForMesh, y, verticalStack);
+      } else if (verticalStack) {
+        addFloorPlanDrawings(plate, floorMap, layer.zones, layer.objects, y);
+      }
+      addZoneLabelsAndFills(plate, layer.zones, y);
+      if (showObjects) addObjectBlocks(plate, layer.objects, y);
+      this.addRoutePath(layer.path, y);
+
+      const floorPois =
+        layer.pois ??
+        data.pois.filter(
+          (p) => Math.abs(nearestFloorYForPoi(p.y, floorLevels) - layer.floorY) < 0.25,
+        );
+      this.addPois(floorPois, data.originId, data.destId, y, plate);
+
+      const label = makeFloorLabelSprite(layer.label);
+      label.position.set(map.minX + 1.2, y + 1.1, map.minZ + 1.2);
+      plate.add(label);
+
+      this.content.add(plate);
+    }
+
+    for (const link of data.connectors ?? []) {
+      this.addGapRoute(link, displayLayers);
+    }
+
+    if (verticalStack) {
+      this.controls.minPolarAngle = 0.1;
+      this.controls.maxPolarAngle = Math.PI - 0.1;
+    } else {
+      this.controls.minPolarAngle = 0.35;
+      this.controls.maxPolarAngle = Math.PI / 2 - 0.12;
+    }
+
+    if (refitCamera) this.fitCameraMulti(data.map, displayLayers, verticalStack);
+  }
+
+  private addRouteSegments(
+    points: THREE.Vector3[],
+    radius = ROUTE_RADIUS,
+    parent: THREE.Object3D = this.content,
+  ): void {
+    if (points.length < 2) return;
     const up = new THREE.Vector3(0, 1, 0);
-    // MeshBasicMaterial keeps the route vivid blue (StandardMaterial + white outline read as white).
     const routeMat = new THREE.MeshBasicMaterial({ color: hex(STYLE.route) });
 
-    for (let i = 0; i < path.length - 1; i++) {
-      const a = new THREE.Vector3(path[i].x, y, path[i].z);
-      const b = new THREE.Vector3(path[i + 1].x, y, path[i + 1].z);
+    for (let i = 0; i < points.length - 1; i++) {
+      const a = points[i];
+      const b = points[i + 1];
       const delta = b.clone().sub(a);
       const len = delta.length();
       if (len < 1e-5) continue;
@@ -630,18 +913,104 @@ export class Floor2DScene3d {
       const dir = delta.normalize();
       const quat = new THREE.Quaternion().setFromUnitVectors(up, dir);
 
-      const seg = new THREE.Mesh(
-        new THREE.CylinderGeometry(ROUTE_RADIUS, ROUTE_RADIUS, len, 12),
-        routeMat,
-      );
+      const seg = new THREE.Mesh(new THREE.CylinderGeometry(radius, radius, len, 12), routeMat);
       seg.position.copy(mid);
       seg.quaternion.copy(quat);
       seg.renderOrder = 12;
-      this.content.add(seg);
+      parent.add(seg);
     }
   }
 
-  private addPois(pois: NavMapPoi[], originId: string, destId: string, floorY: number): void {
+  private addRoutePath(path: { x: number; z: number }[], floorY: number): void {
+    if (path.length < 2) return;
+    const y = floorY + ROUTE_LIFT;
+    const points = path.map((p) => new THREE.Vector3(p.x, y, p.z));
+    this.addRouteSegments(points);
+  }
+
+  private addGapRoute(link: FloorRouteConnector, floors: FloorDisplayLayer[]): void {
+    const leave = floors.find((f) => f.floorId === link.fromFloorId);
+    const enter = floors.find((f) => f.floorId === link.toFloorId);
+    if (!leave || !enter) return;
+    const leaveY = leave.displayY;
+    const enterY = enter.displayY;
+    const worldSpan = enter.floorY - leave.floorY;
+
+    const points: THREE.Vector3[] = [
+      new THREE.Vector3(link.from.x, leaveY + ROUTE_LIFT, link.from.z),
+    ];
+
+    if (link.via.length >= 2) {
+      for (const v of link.via) {
+        const t =
+          Math.abs(worldSpan) > 1e-4
+            ? Math.max(0, Math.min(1, (v.y - leave.floorY) / worldSpan))
+            : 0.5;
+        const y = leaveY + t * (enterY - leaveY) + ROUTE_LIFT;
+        points.push(new THREE.Vector3(v.x, y, v.z));
+      }
+    } else {
+      points.push(
+        new THREE.Vector3(
+          (link.from.x + link.to.x) * 0.5,
+          (leaveY + enterY) * 0.5 + ROUTE_LIFT,
+          (link.from.z + link.to.z) * 0.5,
+        ),
+      );
+    }
+
+    points.push(new THREE.Vector3(link.to.x, enterY + ROUTE_LIFT, link.to.z));
+
+    const deduped: THREE.Vector3[] = [points[0]];
+    for (let i = 1; i < points.length; i++) {
+      if (points[i].distanceToSquared(deduped[deduped.length - 1]) > 1e-6) deduped.push(points[i]);
+    }
+
+    this.addRouteSegments(deduped, ROUTE_RADIUS);
+
+    const gapGroup = new THREE.Group();
+    const stepMat = new THREE.MeshBasicMaterial({
+      color: hex(STYLE.route),
+      transparent: true,
+      opacity: 0.55,
+    });
+    const railMat = new THREE.MeshBasicMaterial({
+      color: hex(STYLE.route),
+      transparent: true,
+      opacity: 0.22,
+    });
+    for (let i = 0; i < deduped.length - 1; i++) {
+      const a = deduped[i];
+      const b = deduped[i + 1];
+      const mid = a.clone().add(b).multiplyScalar(0.5);
+      const len = a.distanceTo(b);
+      if (len < 0.08) continue;
+      const tread = new THREE.Mesh(
+        new THREE.BoxGeometry(0.62, 0.045, Math.min(0.34, len * 0.85)),
+        stepMat,
+      );
+      tread.position.copy(mid);
+      tread.lookAt(b);
+      tread.rotateX(Math.PI / 2);
+      gapGroup.add(tread);
+    }
+    const railH = Math.abs(enterY - leaveY) + ROUTE_LIFT * 2;
+    const railCx = (link.from.x + link.to.x) * 0.5;
+    const railCz = (link.from.z + link.to.z) * 0.5;
+    const railMidY = (leaveY + enterY) * 0.5 + ROUTE_LIFT;
+    const rail = new THREE.Mesh(new THREE.BoxGeometry(0.06, railH, 0.06), railMat);
+    rail.position.set(railCx, railMidY, railCz);
+    gapGroup.add(rail);
+    this.content.add(gapGroup);
+  }
+
+  private addPois(
+    pois: NavMapPoi[],
+    originId: string,
+    destId: string,
+    floorY: number,
+    parent: THREE.Object3D = this.content,
+  ): void {
     const group = new THREE.Group();
     for (const p of pois) {
       const isO = p.id === originId;
@@ -668,7 +1037,31 @@ export class Floor2DScene3d {
       label.position.set(p.x, floorY + pinH + headR * 2 + 0.28, p.z);
       group.add(label);
     }
-    this.content.add(group);
+    parent.add(group);
+  }
+
+  private fitCameraMulti(
+    map: Floor2DMap,
+    floors: FloorDisplayLayer[],
+    verticalStack: boolean,
+  ): void {
+    const cx = (map.minX + map.maxX) / 2;
+    const cz = (map.minZ + map.maxZ) / 2;
+    const ys = floors.map((f) => f.displayY);
+    const minY = Math.min(...ys);
+    const maxY = Math.max(...ys);
+    const midY = (minY + maxY) / 2 + (verticalStack ? 0 : BORDER_WALL_HEIGHT * 0.2);
+    const span = Math.max(map.maxX - map.minX, map.maxZ - map.minZ, 8);
+    const ySpan = Math.max(
+      maxY - minY + (verticalStack ? STACK_PLATE_STEP * 0.6 : BORDER_WALL_HEIGHT * 2.5),
+      5,
+    );
+    this.controls.target.set(cx, midY, cz);
+    const dist = Math.max(span * 1.05, ySpan * 1.35);
+    this.camera.position.set(cx + dist * 0.82, midY + dist * 0.62, cz + dist * 0.82);
+    this.controls.minDistance = 4;
+    this.controls.maxDistance = Math.max(800, dist * 4);
+    this.controls.update();
   }
 
   private fitCamera(map: Floor2DMap): void {

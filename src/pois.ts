@@ -71,21 +71,39 @@ export function parseFloorRouteId(id: string): string | null {
   return isFloorRouteId(id) ? id.slice(FLOOR_ROUTE_PREFIX.length) : null;
 }
 
-export type PoiFloorLevelRef = { floorY: number };
+export type PoiFloorLevelRef = { floorY: number; label?: string };
+
+export function floorLabelForPoi(poi: NavMapPoi, floorLevels: PoiFloorLevelRef[]): string {
+  if (floorLevels.length === 0) return `Y ${poi.y.toFixed(1)}`;
+  const y = nearestFloorYForPoi(poi.y, floorLevels);
+  const floor = floorLevels.find((f) => Math.abs(f.floorY - y) < 1e-4);
+  return floor?.label?.trim() || `Y ${y.toFixed(1)}`;
+}
 
 /** Floor level whose Y is closest to a POI's height. */
 export function nearestFloorYForPoi(poiY: number, floorLevels: PoiFloorLevelRef[]): number {
-  if (floorLevels.length === 0) return poiY;
-  let bestY = floorLevels[0].floorY;
-  let bestDist = Math.abs(floorLevels[0].floorY - poiY);
-  for (let i = 1; i < floorLevels.length; i++) {
-    const d = Math.abs(floorLevels[i].floorY - poiY);
-    if (d < bestDist) {
-      bestDist = d;
-      bestY = floorLevels[i].floorY;
-    }
+  const floor = floorLevelForPoiY(poiY, floorLevels);
+  return floor?.floorY ?? poiY;
+}
+
+/** Named floor level for a POI Y — midpoint bands between adjacent slice heights. */
+export function floorLevelForPoiY<T extends PoiFloorLevelRef>(
+  poiY: number,
+  floorLevels: T[],
+): T | null {
+  if (floorLevels.length === 0) return null;
+  if (floorLevels.length === 1) return floorLevels[0];
+
+  const sorted = [...floorLevels].sort((a, b) => a.floorY - b.floorY);
+  if (poiY < (sorted[0].floorY + sorted[1].floorY) * 0.5) return sorted[0];
+  if (poiY >= (sorted[sorted.length - 2].floorY + sorted[sorted.length - 1].floorY) * 0.5) {
+    return sorted[sorted.length - 1];
   }
-  return bestY;
+  for (let i = 0; i < sorted.length - 1; i++) {
+    const mid = (sorted[i].floorY + sorted[i + 1].floorY) * 0.5;
+    if (poiY < mid) return sorted[i];
+  }
+  return sorted[sorted.length - 1];
 }
 
 function yBandAroundSlice(targetY: number, floorLevels: PoiFloorLevelRef[]): number {
@@ -108,6 +126,60 @@ function yBandAroundSlice(targetY: number, floorLevels: PoiFloorLevelRef[]): num
  * POIs for one floor slice: each POI belongs to the nearest named floor Y.
  * When previewing an unsaved Y, uses a band between adjacent floor heights.
  */
+function sortedFloorLevels<T extends PoiFloorLevelRef>(floorLevels: T[]): T[] {
+  return [...floorLevels].sort((a, b) => a.floorY - b.floorY);
+}
+
+export function floorIndexForLevel<T extends PoiFloorLevelRef>(
+  floor: T,
+  floorLevels: T[],
+): number {
+  const sorted = sortedFloorLevels(floorLevels);
+  const idx = sorted.findIndex((f) => f.floorY === floor.floorY);
+  return idx >= 0 ? idx : 0;
+}
+
+/**
+ * POIs visible when a floor is selected: Floor 1 → that level only;
+ * higher floors include POIs from every level below through the selected one.
+ */
+export function filterPoisCumulativeThroughFloor<T extends PoiFloorLevelRef>(
+  pois: NavMapPoi[],
+  activeFloor: T,
+  floorLevels: T[],
+): NavMapPoi[] {
+  if (pois.length === 0 || floorLevels.length === 0) return pois;
+  const sorted = sortedFloorLevels(floorLevels);
+  const activeIdx = floorIndexForLevel(activeFloor, floorLevels);
+  if (activeIdx <= 0) {
+    return filterPoisByFloorY(pois, activeFloor.floorY, floorLevels);
+  }
+  const allowed = new Set(sorted.slice(0, activeIdx + 1).map((f) => f.floorY));
+  return pois.filter((p) => {
+    const y = nearestFloorYForPoi(p.y, floorLevels);
+    for (const fy of allowed) {
+      if (Math.abs(y - fy) < 1e-4) return true;
+    }
+    return false;
+  });
+}
+
+/** POIs that belong on one stacked plate for the current floor selection. */
+export function filterPoisForStackedPlate<T extends PoiFloorLevelRef>(
+  pois: NavMapPoi[],
+  plateFloor: T,
+  activeFloor: T,
+  floorLevels: T[],
+): NavMapPoi[] {
+  const sorted = sortedFloorLevels(floorLevels);
+  const plateIdx = sorted.findIndex((f) => f.floorY === plateFloor.floorY);
+  const activeIdx = floorIndexForLevel(activeFloor, floorLevels);
+  if (plateIdx < 0 || plateIdx > activeIdx) return [];
+  return pois.filter(
+    (p) => Math.abs(nearestFloorYForPoi(p.y, floorLevels) - plateFloor.floorY) < 0.25,
+  );
+}
+
 export function filterPoisByFloorY(
   pois: NavMapPoi[],
   targetFloorY: number,
@@ -150,6 +222,7 @@ export function fillRouteEndpointSelect(
   floors: RouteFloorOption[] = [],
   excludeId?: string,
   selectedId?: string,
+  poiFloorLevels?: PoiFloorLevelRef[],
 ): void {
   const want = selectedId !== undefined ? selectedId : select.value;
   select.replaceChildren();
@@ -168,7 +241,10 @@ export function fillRouteEndpointSelect(
       if (poi.id === want) canRestore = true;
       const opt = document.createElement('option');
       opt.value = poi.id;
-      opt.textContent = poi.name;
+      opt.textContent =
+        poiFloorLevels && poiFloorLevels.length >= 2
+          ? `${poi.name} (${floorLabelForPoi(poi, poiFloorLevels)})`
+          : poi.name;
       group.appendChild(opt);
     }
     select.appendChild(group);

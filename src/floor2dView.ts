@@ -1,5 +1,12 @@
 import type { NavMesh } from 'recast-navigation';
-import { parseFloorRouteId, parseZoneRouteId, type NavMapPoi } from './pois';
+import {
+  filterPoisByFloorY,
+  findNavMapPoi,
+  nearestFloorYForPoi,
+  parseFloorRouteId,
+  parseZoneRouteId,
+  type NavMapPoi,
+} from './pois';
 import {
   applyRegionEdit,
   cloneRegionBlock,
@@ -25,7 +32,15 @@ import {
   type FloorLevel,
   type FloorShape,
 } from './floor2d';
-import { findPathOnFloorGrid } from './floor2dRoute';
+import { findPathOnFloorGrid, type FloorPathPoint } from './floor2dRoute';
+import {
+  computeMultiFloorRoute,
+  getFloorWalkGrid,
+  previewMapForFloor,
+  type FloorRouteConnector,
+  type FloorRouteSegment,
+  type RouteBreakPoint,
+} from './floor2dMultiRoute';
 import { Floor2DScene3d } from './floor2dScene3d';
 import { extractNavMeshSlice2D, type NavMeshSliceTri } from './navmesh2d';
 import {
@@ -81,6 +96,9 @@ export class Floor2DView {
   readonly canvas: HTMLCanvasElement;
   private scene3d: Floor2DScene3d | null = null;
   private iso3d = false;
+  private multiFloor3dAuto = false;
+  /** Multi-floor 3D stacked plates (View Stack); off = single-floor 2D paper. */
+  private viewStack = false;
   private map: Floor2DMap | null = null;
   private editWalk: Uint8Array | null = null;
   private editObjects: FloorBlock[] = [];
@@ -92,6 +110,12 @@ export class Floor2DView {
   private dirty = false;
   private draft: { x0: number; z0: number; x1: number; z1: number } | null = null;
   private path: { x: number; z: number }[] = [];
+  private routeSegments: FloorRouteSegment[] = [];
+  private routeConnectors: FloorRouteConnector[] = [];
+  private routeError: string | null = null;
+  private routeDebugForward: FloorRouteSegment[] = [];
+  private routeDebugReverse: FloorRouteSegment[] = [];
+  private routeBreakPoints: RouteBreakPoint[] = [];
   private pois: NavMapPoi[] = [];
   private originId = '';
   private destId = '';
@@ -114,8 +138,10 @@ export class Floor2DView {
   private onZonesChange?: () => void;
   private onFloorsChange?: () => void;
   private onRouteRebuild?: () => void;
+  private onIso3dChange?: (on: boolean) => void;
   private onZoneSelectionChange?: (zoneId: string | null) => void;
   private onFloorActivate?: (floor: FloorLevel) => void;
+  private onViewStackChange?: (on: boolean) => void;
   private zoneDialog: HTMLDivElement | null = null;
   private zoneNameInput: HTMLInputElement | null = null;
   private zoneDialogResolve: ((name: string | null) => void) | null = null;
@@ -153,17 +179,85 @@ export class Floor2DView {
     return this.iso3d;
   }
 
+  private scene3dWanted(): boolean {
+    return this.iso3d || this.viewStack;
+  }
+
+  private updateScene3dVisibility(): void {
+    const show = this.scene3dWanted();
+    this.scene3d?.setVisible(show);
+    this.canvas.style.display = show ? 'none' : 'block';
+  }
+
   /** Toggle extruded 3D walls with orbit / tilt (drag to rotate view). */
   toggleIso3d(): boolean {
     this.iso3d = !this.iso3d;
-    this.scene3d?.setVisible(this.iso3d);
-    this.canvas.style.display = this.iso3d ? 'none' : 'block';
-    if (this.iso3d) {
+    this.updateScene3dVisibility();
+    if (this.scene3dWanted()) {
       this.syncScene3d(true);
     } else {
       this.draw();
     }
+    this.onIso3dChange?.(this.iso3d);
     return this.iso3d;
+  }
+
+  isMultiFloor3dAuto(): boolean {
+    return this.multiFloor3dAuto;
+  }
+
+  setOnIso3dChange(cb: (on: boolean) => void): void {
+    this.onIso3dChange = cb;
+  }
+
+  private enableMultiFloor3dView(): void {
+    if (!this.scene3d || !this.map) return;
+    this.multiFloor3dAuto = true;
+    this.updateScene3dVisibility();
+  }
+
+  private usesStackedPlate3d(): boolean {
+    return this.viewStack && this.usesStackedLayout() && this.tool === 'pan';
+  }
+
+  isViewStack(): boolean {
+    return this.viewStack;
+  }
+
+  toggleViewStack(): boolean {
+    if (!this.usesStackedLayout()) {
+      this.viewStack = false;
+      return false;
+    }
+    this.viewStack = !this.viewStack;
+    if (this.viewStack) {
+      this.tool = 'pan';
+      this.canvas.style.cursor = 'grab';
+      this.onToolChange?.('pan');
+      this.enableMultiFloor3dView();
+      this.syncScene3d(true);
+    } else {
+      this.disableMultiFloor3dView();
+      this.fit();
+      if (this.iso3d) this.syncScene3d(true);
+      else this.draw();
+    }
+    this.onViewStackChange?.(this.viewStack);
+    this.refreshFloorSidebar();
+    return this.viewStack;
+  }
+
+  setViewStack(on: boolean): void {
+    if (on === this.viewStack) return;
+    if (on && !this.usesStackedLayout()) return;
+    if (on) this.toggleViewStack();
+    else if (this.viewStack) this.toggleViewStack();
+  }
+
+  private disableMultiFloor3dView(): void {
+    if (!this.multiFloor3dAuto) return;
+    this.multiFloor3dAuto = false;
+    this.updateScene3dVisibility();
   }
 
   setIso3d(on: boolean): void {
@@ -172,20 +266,70 @@ export class Floor2DView {
   }
 
   private syncScene3d(refitCamera = false): void {
-    if (!this.iso3d || !this.scene3d || !this.map || !this.editWalk) return;
+    if (!this.scene3dWanted() || !this.scene3d || !this.map) return;
+
+    if (this.usesStackedPlate3d()) {
+      const floors = this.sortedFloors();
+      const layers = floors.map((floor) => {
+        const preview = previewMapForFloor(this.map!, floor, this.editFloors);
+        const walk = this.walkForFloorLevel(floor);
+        const isActive = floor.id === this.activeFloorId;
+        const seg = this.routeSegments.find((s) => s.floorId === floor.id);
+        const path = seg ? this.trimPathForFloor(floor.id, seg.path) : [];
+        const platePois = filterPoisByFloorY(this.pois, floor.floorY, this.editFloors);
+        return {
+          floorId: floor.id,
+          label: floor.label.trim() || 'Floor',
+          floorY: floor.floorY,
+          map: preview,
+          walk: walk ?? new Uint8Array(0),
+          objects: floor.objects ?? (isActive ? this.editObjects : []),
+          zones: floor.zones ?? (isActive ? this.editZones : []),
+          path: path.map((p) => ({ x: p.x, z: p.z })),
+          pois: platePois,
+        };
+      });
+      this.scene3d.sync(
+        {
+          multiFloor: true,
+          map: this.map,
+          floors: layers,
+          connectors: this.routeConnectors,
+          floorLevels: this.editFloors,
+          walk: this.editWalk ?? new Uint8Array(0),
+          objects: this.editObjects,
+          zones: this.editZones,
+          path: this.path,
+          pois: this.pois,
+          originId: this.originId,
+          destId: this.destId,
+          verticalPlateStack: true,
+          showWalls: true,
+          showInteriorVolumes: true,
+          showObjects: true,
+        },
+        refitCamera,
+      );
+      return;
+    }
+
+    if (!this.editWalk) return;
     const preview = this.previewMap();
     if (!preview) return;
-    this.scene3d.sync({
-      map: preview,
-      walk: this.editWalk,
-      objects: this.editObjects,
-      zones: this.editZones,
-      stores: preview.stores,
-      path: this.path,
-      pois: this.pois,
-      originId: this.originId,
-      destId: this.destId,
-    }, refitCamera);
+    this.scene3d.sync(
+      {
+        map: preview,
+        walk: this.editWalk,
+        objects: this.editObjects,
+        zones: this.editZones,
+        stores: preview.stores,
+        path: this.path,
+        pois: this.pois,
+        originId: this.originId,
+        destId: this.destId,
+      },
+      refitCamera,
+    );
   }
 
   private buildZoneSidebar(mapParent: HTMLElement): void {
@@ -202,7 +346,7 @@ export class Floor2DView {
 
     const floorHint = document.createElement('div');
     floorHint.className = 'floor2d-zone-sidebar__hint';
-    floorHint.textContent = 'Set Y, draw, Add Floor — click a level to return to its slice';
+    floorHint.textContent = 'Click a floor for its plan — View all floors for the 3D stack';
 
     const floorList = document.createElement('div');
     floorList.className = 'floor2d-zone-list floor2d-floor-list';
@@ -464,9 +608,34 @@ export class Floor2DView {
     if (!floor) return null;
     this.flushCurrentFloorState();
     this.activeFloorId = floor.id;
+    if (this.viewStack) {
+      this.viewStack = false;
+      this.disableMultiFloor3dView();
+      this.onViewStackChange?.(false);
+    }
     this.refreshFloorSidebar();
+    this.fit();
     this.onFloorActivate?.(floor);
+    this.draw();
     return floor;
+  }
+
+  activateViewAllFloors(): void {
+    if (!this.usesStackedLayout()) return;
+    if (!this.viewStack) this.toggleViewStack();
+    else {
+      this.syncScene3d(false);
+      this.refreshFloorSidebar();
+    }
+  }
+
+  /** POIs for map + origin/destination lists from the current floor selection. */
+  poisForDisplay(source?: NavMapPoi[]): NavMapPoi[] {
+    const list = source ?? this.pois;
+    if (this.viewStack) return list;
+    const active = this.getActiveFloor();
+    if (!active || list.length === 0) return list;
+    return filterPoisByFloorY(list, active.floorY, this.editFloors);
   }
 
   setZoneDrawMode(mode: ZoneDrawMode): void {
@@ -518,11 +687,30 @@ export class Floor2DView {
       this.floorListEl.appendChild(empty);
       return;
     }
-    for (const floor of this.editFloors) {
+    if (this.editFloors.length >= 2) {
+      const viewAllBtn = document.createElement('button');
+      viewAllBtn.type = 'button';
+      viewAllBtn.className = 'floor2d-zone-item floor2d-zone-item--view-all';
+      if (this.viewStack) viewAllBtn.classList.add('floor2d-zone-item--floor-active');
+      const dot = document.createElement('span');
+      dot.className = 'floor2d-zone-item__dot';
+      dot.style.background = '#5b8def';
+      const name = document.createElement('span');
+      name.className = 'floor2d-zone-item__name';
+      name.textContent = 'View all floors';
+      viewAllBtn.append(dot, name);
+      viewAllBtn.addEventListener('click', () => {
+        this.activateViewAllFloors();
+      });
+      this.floorListEl.appendChild(viewAllBtn);
+    }
+
+    for (let i = 0; i < this.editFloors.length; i++) {
+      const floor = this.editFloors[i];
       const btn = document.createElement('button');
       btn.type = 'button';
       btn.className = 'floor2d-zone-item';
-      if (floor.id === this.activeFloorId) {
+      if (floor.id === this.activeFloorId && !this.viewStack) {
         btn.classList.add('floor2d-zone-item--floor-active');
       }
 
@@ -532,7 +720,7 @@ export class Floor2DView {
 
       const name = document.createElement('span');
       name.className = 'floor2d-zone-item__name';
-      name.textContent = `${floor.label.trim() || 'Untitled floor'} (Y=${floor.floorY})`;
+      name.textContent = floor.label.trim() || `Floor ${i + 1}`;
 
       btn.append(dot, name);
       btn.addEventListener('click', () => {
@@ -615,6 +803,10 @@ export class Floor2DView {
     this.onFloorActivate = fn;
   }
 
+  setOnViewStackChange(fn: (on: boolean) => void): void {
+    this.onViewStackChange = fn;
+  }
+
   deleteSelectedZone(): boolean {
     if (!this.selectedZoneId) return false;
     this.pushHistory();
@@ -681,6 +873,78 @@ export class Floor2DView {
     return { path: out.path };
   }
 
+  usesStackedLayout(): boolean {
+    return this.editFloors.length >= 2;
+  }
+
+  hasValidRoute(): boolean {
+    if (this.routeSegments.length > 0) {
+      return this.routeSegments.some((s) => s.path.length >= 2);
+    }
+    return this.path.length >= 2;
+  }
+
+  setRoutePlan(
+    segments: FloorRouteSegment[],
+    connectors: FloorRouteConnector[],
+    error?: string,
+    debug?: {
+      forward?: FloorRouteSegment[];
+      reverse?: FloorRouteSegment[];
+      breakPoints?: RouteBreakPoint[];
+    },
+  ): void {
+    const refit3d = this.routeSegments.length === 0 && segments.length > 0;
+    const hasRoute = segments.some((s) => s.path.length >= 2);
+    this.routeSegments = segments;
+    this.routeConnectors = connectors;
+    this.routeBreakPoints = debug?.breakPoints ?? [];
+    this.routeDebugForward = debug?.forward ?? [];
+    this.routeDebugReverse = debug?.reverse ?? [];
+    this.routeError = hasRoute ? (error ?? null) : (error ?? null);
+    if (segments.length === 1) {
+      this.path = segments[0].path.map((p) => ({ x: p.x, z: p.z }));
+    } else {
+      this.path = [];
+    }
+    if (this.usesStackedPlate3d()) {
+      this.enableMultiFloor3dView();
+      this.syncScene3d(refit3d);
+      return;
+    }
+    this.draw();
+  }
+
+  computeAndSetRoute(
+    navMesh: NavMesh | null,
+    origin: { x: number; y: number; z: number },
+    destination: { x: number; y: number; z: number },
+  ): { valid: boolean; error?: string } {
+    if (!this.map) {
+      this.setRoutePlan([], [], 'Floor map not ready');
+      return { valid: false, error: 'Floor map not ready' };
+    }
+    const plan = computeMultiFloorRoute(
+      this.map,
+      this.editFloors,
+      navMesh,
+      origin,
+      destination,
+      this.editWalk,
+      this.activeFloorId,
+      this.editObjects,
+    );
+    this.setRoutePlan(plan.segments, plan.connectors, plan.error, {
+      forward: plan.debugForward,
+      reverse: plan.debugReverse,
+      breakPoints: plan.breakPoints,
+    });
+    return {
+      valid: plan.segments.some((s) => s.path.length >= 2),
+      error: plan.error,
+    };
+  }
+
   resolveRouteEndpoint(
     id: string,
     sliceY: number,
@@ -700,7 +964,7 @@ export class Floor2DView {
       const c = zoneCentroid(zone);
       return { x: c.x, y: sliceY, z: c.z, name: zone.label.trim() || 'Untitled zone' };
     }
-    const poi = this.pois.find((p) => p.id === id);
+    const poi = this.pois.find((p) => p.id === id) ?? findNavMapPoi(id);
     if (poi) return { x: poi.x, y: poi.y, z: poi.z, name: poi.name };
     return null;
   }
@@ -770,6 +1034,11 @@ export class Floor2DView {
     else this.canvas.style.cursor = 'crosshair';
     this.onToolChange?.(tool);
     this.refreshZoneSidebar();
+    if (this.usesStackedLayout()) {
+      this.fit();
+      if (tool === 'pan' && this.viewStack) this.enableMultiFloor3dView();
+      else if (this.multiFloor3dAuto) this.disableMultiFloor3dView();
+    }
     this.draw();
   }
 
@@ -903,6 +1172,12 @@ export class Floor2DView {
   }
 
   setPath(points: { x: number; y: number; z: number }[]): void {
+    this.routeSegments = [];
+    this.routeConnectors = [];
+    this.routeError = null;
+    this.routeDebugForward = [];
+    this.routeDebugReverse = [];
+    this.routeBreakPoints = [];
     this.path = points.map((p) => ({ x: p.x, z: p.z }));
     this.draw();
   }
@@ -954,6 +1229,9 @@ export class Floor2DView {
 
   fit(): void {
     if (!this.map) return;
+    if (this.usesStackedPlate3d()) {
+      return;
+    }
     const parent = this.canvas.parentElement;
     if (!parent) return;
     const w = Math.max(1, parent.clientWidth);
@@ -966,6 +1244,84 @@ export class Floor2DView {
     this.scale = Math.min((w * 0.9) / mapW, (h * 0.9) / mapH) * dpr;
     this.offsetX = (this.canvas.width - mapW * this.scale) / 2 - this.map.minX * this.scale;
     this.offsetY = (this.canvas.height - mapH * this.scale) / 2 - this.map.minZ * this.scale;
+  }
+
+  private fitStackedView(): void {
+    if (!this.map) return;
+    const parent = this.canvas.parentElement;
+    if (!parent) return;
+    const w = Math.max(1, parent.clientWidth);
+    const h = Math.max(1, parent.clientHeight);
+    const mapW = this.map.maxX - this.map.minX;
+    const mapH = this.map.maxZ - this.map.minZ;
+    const dpr = Math.min(window.devicePixelRatio, 2);
+    const layerCount = this.editFloors.length;
+    const gapPx = this.stackGapPx(dpr);
+    const pad = this.platePadPx(dpr);
+    const thickness = this.plateThicknessPx(dpr);
+    this.canvas.width = Math.floor(w * dpr);
+    this.canvas.height = Math.floor(h * dpr);
+    const scaleW = ((w * 0.86) / mapW) * dpr;
+    const plateHAtScaleW = mapH * scaleW + pad * 2 + thickness;
+    const totalHAtScaleW = plateHAtScaleW * layerCount + gapPx * Math.max(0, layerCount - 1);
+    const scaleH = ((h * 0.86) / totalHAtScaleW) * dpr;
+    this.scale = Math.min(scaleW, scaleH);
+    const plateH = mapH * this.scale + pad * 2 + thickness;
+    const contentH = plateH * layerCount + gapPx * Math.max(0, layerCount - 1);
+    this.offsetX = (this.canvas.width - mapW * this.scale) / 2 - this.map.minX * this.scale;
+    this.offsetY = (this.canvas.height - contentH) / 2 - this.map.minZ * this.scale;
+  }
+
+  private sortedFloors(): FloorLevel[] {
+    return [...this.editFloors].sort((a, b) => a.floorY - b.floorY);
+  }
+
+  /** Visible air gap between stacked floor plates. */
+  private stackGapPx(dpr: number): number {
+    return 48 * dpr;
+  }
+
+  private plateThicknessPx(dpr: number): number {
+    return 7 * dpr;
+  }
+
+  private platePadPx(dpr: number): number {
+    return 8 * dpr;
+  }
+
+  /** Lower floor at bottom; each higher floor stacks upward. */
+  private stackLayerDy(layerIndex: number, mapH: number, gapPx: number, dpr: number): number {
+    const pad = this.platePadPx(dpr);
+    const plateThickness = this.plateThicknessPx(dpr);
+    const plateH = mapH * this.scale + pad * 2 + plateThickness;
+    return -layerIndex * (plateH + gapPx);
+  }
+
+  private layerDyForFloorId(
+    floorId: string,
+    floors: FloorLevel[],
+    mapH: number,
+    gapPx: number,
+    dpr: number,
+  ): number {
+    const idx = floors.findIndex((f) => f.id === floorId);
+    return idx >= 0 ? this.stackLayerDy(idx, mapH, gapPx, dpr) : 0;
+  }
+
+  private plateBounds(
+    layerIndex: number,
+    mapH: number,
+    gapPx: number,
+    dpr: number,
+  ): { x0: number; y0: number; x1: number; y1: number; dy: number; thickness: number } {
+    const pad = this.platePadPx(dpr);
+    const thickness = this.plateThicknessPx(dpr);
+    const dy = this.stackLayerDy(layerIndex, mapH, gapPx, dpr);
+    const x0 = this.wx(this.map!.minX) - pad;
+    const y0 = this.wz(this.map!.minZ) - pad;
+    const cardW = (this.map!.maxX - this.map!.minX) * this.scale + pad * 2;
+    const cardH = mapH * this.scale + pad * 2;
+    return { x0, y0, x1: x0 + cardW, y1: y0 + cardH, dy, thickness };
   }
 
   private cloneSnapshot(): EditSnapshot | null {
@@ -1017,8 +1373,14 @@ export class Floor2DView {
   private screenToWorld(clientX: number, clientY: number): { x: number; z: number } {
     const rect = this.canvas.getBoundingClientRect();
     const dpr = this.canvas.width / Math.max(1, rect.width);
-    const sx = (clientX - rect.left) * dpr;
-    const sy = (clientY - rect.top) * dpr;
+    let sx = (clientX - rect.left) * dpr;
+    let sy = (clientY - rect.top) * dpr;
+    if (this.usesStackedLayout() && this.tool !== 'pan' && this.map && this.activeFloorId) {
+      const floors = this.sortedFloors();
+      const gapPx = this.stackGapPx(dpr);
+      const mapH = this.map.maxZ - this.map.minZ;
+      sy -= this.layerDyForFloorId(this.activeFloorId, floors, mapH, gapPx, dpr);
+    }
     return { x: (sx - this.offsetX) / this.scale, z: (sy - this.offsetY) / this.scale };
   }
 
@@ -1368,14 +1730,15 @@ export class Floor2DView {
     }
   }
 
-  private drawWalkGrid(ctx: CanvasRenderingContext2D): void {
-    if (!this.map || !this.editWalk) return;
+  private drawWalkGrid(ctx: CanvasRenderingContext2D, walkOverride?: Uint8Array | null): void {
+    const walk = walkOverride ?? this.editWalk;
+    if (!this.map || !walk) return;
     const { minX, minZ, cellSize, cols, rows } = this.map;
     const cellPx = cellSize * this.scale;
     ctx.fillStyle = FLOOR2D_STYLE.corridor;
     for (let r = 0; r < rows; r++) {
       for (let c = 0; c < cols; c++) {
-        if (!this.editWalk[r * cols + c]) continue;
+        if (!walk[r * cols + c]) continue;
         const x = minX + c * cellSize;
         const z = minZ + r * cellSize;
         ctx.fillRect(this.wx(x), this.wz(z), cellPx, cellPx);
@@ -1383,9 +1746,9 @@ export class Floor2DView {
     }
   }
 
-  private drawObjects(ctx: CanvasRenderingContext2D, dpr: number): void {
+  private drawObjects(ctx: CanvasRenderingContext2D, dpr: number, objects?: FloorBlock[]): void {
     const lineW = Math.max(1.25, 1.5 * dpr);
-    for (const b of this.editObjects) {
+    for (const b of objects ?? this.editObjects) {
       const x = this.wx(b.x);
       const y = this.wz(b.z);
       const w = b.w * this.scale;
@@ -1498,9 +1861,9 @@ export class Floor2DView {
     this.drawRegionPolygonDraft(ctx, dpr, this.polygonDraft, FLOOR2D_STYLE.accent);
   }
 
-  private drawZones(ctx: CanvasRenderingContext2D, dpr: number): void {
+  private drawZones(ctx: CanvasRenderingContext2D, dpr: number, zones?: FloorBlock[]): void {
     const lineW = Math.max(2, 2.5 * dpr);
-    for (const b of this.editZones) {
+    for (const b of zones ?? this.editZones) {
       const stroke = b.stroke || FLOOR2D_STYLE.accent;
       const selected = b.id === this.selectedZoneId;
       this.drawZoneOutline(ctx, b, stroke, lineW, true, selected);
@@ -1591,28 +1954,398 @@ export class Floor2DView {
     ctx.setLineDash([]);
   }
 
-  private drawRoute(ctx: CanvasRenderingContext2D, dpr: number): void {
-    if (this.path.length < 2) return;
-    const lw = Math.max(7, 8 * dpr);
-    const outline = lw + 3.5 * dpr;
+  private drawRouteOnPath(
+    ctx: CanvasRenderingContext2D,
+    dpr: number,
+    path: FloorPathPoint[] | { x: number; z: number }[],
+    color = FLOOR2D_STYLE.route,
+    dashed = false,
+    lineWidth?: number,
+  ): void {
+    if (path.length < 2) return;
+    const lw = lineWidth ?? Math.max(7, 8 * dpr);
     ctx.lineJoin = 'round';
     ctx.lineCap = 'round';
     ctx.beginPath();
-    ctx.moveTo(this.wx(this.path[0].x), this.wz(this.path[0].z));
-    for (let i = 1; i < this.path.length; i++) {
-      ctx.lineTo(this.wx(this.path[i].x), this.wz(this.path[i].z));
+    ctx.moveTo(this.wx(path[0].x), this.wz(path[0].z));
+    for (let i = 1; i < path.length; i++) {
+      ctx.lineTo(this.wx(path[i].x), this.wz(path[i].z));
     }
-    ctx.strokeStyle = FLOOR2D_STYLE.routeOutline;
-    ctx.lineWidth = outline;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = lw;
+    if (dashed) ctx.setLineDash([6 * dpr, 5 * dpr]);
     ctx.stroke();
-    ctx.beginPath();
-    ctx.moveTo(this.wx(this.path[0].x), this.wz(this.path[0].z));
-    for (let i = 1; i < this.path.length; i++) {
-      ctx.lineTo(this.wx(this.path[i].x), this.wz(this.path[i].z));
+    if (dashed) ctx.setLineDash([]);
+  }
+
+  private drawRouteDebugForFloor(ctx: CanvasRenderingContext2D, dpr: number, floorId: string): void {
+    const fwd = this.routeDebugForward.find((s) => s.floorId === floorId);
+    const rev = this.routeDebugReverse.find((s) => s.floorId === floorId);
+    if (fwd) {
+      this.drawRouteOnPath(ctx, dpr, fwd.path, '#16a34a', true, Math.max(4, 5 * dpr));
     }
+    if (rev) {
+      this.drawRouteOnPath(ctx, dpr, rev.path, '#ea580c', true, Math.max(4, 5 * dpr));
+    }
+  }
+
+  private drawRouteDebugLegend(ctx: CanvasRenderingContext2D, dpr: number): void {
+    if (this.routeDebugForward.length === 0 && this.routeDebugReverse.length === 0) return;
+    const fontSize = Math.max(9, 10 * dpr);
+    const pad = 10 * dpr;
+    const lineH = fontSize + 6 * dpr;
+    const rows = [
+      { color: FLOOR2D_STYLE.route, label: 'Merged route', dashed: false },
+      { color: '#16a34a', label: 'O→D probe', dashed: true },
+      { color: '#ea580c', label: 'D→O probe', dashed: true },
+      { color: '#dc2626', label: 'Break / bridge', dashed: false },
+    ];
+    const boxW = 132 * dpr;
+    const boxH = pad * 2 + rows.length * lineH;
+    const x0 = pad;
+    const y0 = pad;
+
+    ctx.fillStyle = 'rgba(255,255,255,0.92)';
+    ctx.strokeStyle = 'rgba(15,23,42,0.12)';
+    ctx.lineWidth = 1 * dpr;
+    ctx.beginPath();
+    ctx.roundRect(x0, y0, boxW, boxH, 8 * dpr);
+    ctx.fill();
+    ctx.stroke();
+
+    ctx.font = `600 ${fontSize}px -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif`;
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    rows.forEach((row, i) => {
+      const y = y0 + pad + i * lineH + lineH * 0.5;
+      const lx = x0 + pad;
+      ctx.strokeStyle = row.color;
+      ctx.lineWidth = row.dashed ? 2 * dpr : 4 * dpr;
+      if (row.dashed) ctx.setLineDash([4 * dpr, 3 * dpr]);
+      ctx.beginPath();
+      ctx.moveTo(lx, y);
+      ctx.lineTo(lx + 22 * dpr, y);
+      ctx.stroke();
+      if (row.dashed) ctx.setLineDash([]);
+      ctx.fillStyle = '#0f172a';
+      ctx.fillText(row.label, lx + 28 * dpr, y);
+    });
+  }
+
+  private drawRouteBreakPoints(ctx: CanvasRenderingContext2D, dpr: number, floorId?: string): void {
+    const pts = floorId
+      ? this.routeBreakPoints.filter((b) => b.floorId === floorId)
+      : this.routeBreakPoints;
+    if (pts.length === 0) return;
+
+    const fontSize = Math.max(9, 10 * dpr);
+    ctx.font = `600 ${fontSize}px -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'bottom';
+
+    for (const bp of pts) {
+      const px = this.wx(bp.x);
+      const py = this.wz(bp.z);
+      const r = 9 * dpr;
+      ctx.fillStyle = '#dc2626';
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = 2 * dpr;
+      ctx.beginPath();
+      ctx.arc(px, py, r, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = '#991b1b';
+      const label = bp.label.length > 36 ? `${bp.label.slice(0, 34)}…` : bp.label;
+      ctx.fillText(label, px, py - r - 4 * dpr);
+    }
+  }
+
+  private drawRoute(ctx: CanvasRenderingContext2D, dpr: number): void {
+    const floorId = this.activeFloorId;
+    if (this.routeSegments.length > 1) {
+      if (!floorId) return;
+      const seg = this.routeSegments.find((s) => s.floorId === floorId);
+      this.drawRouteDebugForFloor(ctx, dpr, floorId);
+      if (seg) {
+        this.drawRouteOnPath(ctx, dpr, this.trimPathForFloor(floorId, seg.path));
+      }
+      this.drawRouteBreakPoints(ctx, dpr, floorId);
+      return;
+    }
+    if (floorId) this.drawRouteDebugForFloor(ctx, dpr, floorId);
+    this.drawRouteOnPath(ctx, dpr, this.path);
+    this.drawRouteBreakPoints(ctx, dpr, floorId ?? undefined);
+    this.drawRouteDebugLegend(ctx, dpr);
+  }
+
+  private nearestPathIndex(path: { x: number; z: number }[], x: number, z: number): number {
+    let best = 0;
+    let bestD = Infinity;
+    for (let i = 0; i < path.length; i++) {
+      const d = (path[i].x - x) ** 2 + (path[i].z - z) ** 2;
+      if (d < bestD) {
+        bestD = d;
+        best = i;
+      }
+    }
+    return best;
+  }
+
+  private trimPathForFloor(floorId: string, path: FloorPathPoint[]): FloorPathPoint[] {
+    if (path.length < 2) return path;
+    let out = [...path];
+    for (const link of this.routeConnectors) {
+      if (link.fromFloorId === floorId) {
+        const idx = this.nearestPathIndex(out, link.from.x, link.from.z);
+        out = out.slice(0, idx + 1);
+      }
+      if (link.toFloorId === floorId) {
+        const idx = this.nearestPathIndex(out, link.to.x, link.to.z);
+        out = out.slice(idx);
+      }
+    }
+    return out.length >= 2 ? out : path;
+  }
+
+  private drawRouteScreenPath(
+    ctx: CanvasRenderingContext2D,
+    dpr: number,
+    points: { x: number; y: number }[],
+  ): void {
+    if (points.length < 2) return;
+    const lw = Math.max(7, 8 * dpr);
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(points[0].x, points[0].y);
+    for (let i = 1; i < points.length; i++) ctx.lineTo(points[i].x, points[i].y);
     ctx.strokeStyle = FLOOR2D_STYLE.route;
     ctx.lineWidth = lw;
     ctx.stroke();
+  }
+
+  private drawStepTicksInGap(
+    ctx: CanvasRenderingContext2D,
+    dpr: number,
+    path: { x: number; y: number }[],
+    gapTop: number,
+    gapBottom: number,
+  ): void {
+    const inGap = path.filter((p) => p.y >= gapTop - 1 && p.y <= gapBottom + 1);
+    if (inGap.length < 2) return;
+    const minY = Math.min(...inGap.map((p) => p.y));
+    const maxY = Math.max(...inGap.map((p) => p.y));
+    const cx = inGap.reduce((sum, p) => sum + p.x, 0) / inGap.length;
+    const steps = 5;
+    ctx.strokeStyle = 'rgba(37,99,235,0.4)';
+    ctx.lineWidth = Math.max(1.25, 1.5 * dpr);
+    for (let s = 1; s < steps; s++) {
+      const y = minY + (s / steps) * (maxY - minY);
+      ctx.beginPath();
+      ctx.moveTo(cx - 14 * dpr, y);
+      ctx.lineTo(cx + 14 * dpr, y);
+      ctx.stroke();
+    }
+  }
+
+  /** Stair / lift route drawn in the air gap between floor plates. */
+  private drawGapStairRoutes(
+    ctx: CanvasRenderingContext2D,
+    dpr: number,
+    floors: FloorLevel[],
+    mapH: number,
+    gapPx: number,
+  ): void {
+    if (this.routeConnectors.length === 0) return;
+    for (const link of this.routeConnectors) {
+      const leaveIdx = floors.findIndex((f) => f.id === link.fromFloorId);
+      const enterIdx = floors.findIndex((f) => f.id === link.toFloorId);
+      if (leaveIdx < 0 || enterIdx < 0) continue;
+
+      const leaveBounds = this.plateBounds(leaveIdx, mapH, gapPx, dpr);
+      const enterBounds = this.plateBounds(enterIdx, mapH, gapPx, dpr);
+      const goingUp = leaveIdx < enterIdx;
+      const lowerBounds = goingUp ? leaveBounds : enterBounds;
+      const upperBounds = goingUp ? enterBounds : leaveBounds;
+      const lowerFloor = floors[goingUp ? leaveIdx : enterIdx];
+      const upperFloor = floors[goingUp ? enterIdx : leaveIdx];
+
+      const gapTop = upperBounds.y1 + upperBounds.dy;
+      const gapBottom = lowerBounds.y0 + lowerBounds.dy;
+
+      const exitSx = this.wx(link.from.x);
+      const exitSy = this.wz(link.from.z) + leaveBounds.dy;
+      const enterSx = this.wx(link.to.x);
+      const enterSy = this.wz(link.to.z) + enterBounds.dy;
+
+      const screenPts: { x: number; y: number }[] = [ { x: exitSx, y: exitSy } ];
+
+      if (goingUp) {
+        screenPts.push({ x: exitSx, y: lowerBounds.y0 + lowerBounds.dy });
+        const ySpan = upperFloor.floorY - lowerFloor.floorY;
+        if (link.via.length >= 2 && Math.abs(ySpan) > 1e-4) {
+          for (const v of link.via) {
+            const t = Math.max(0, Math.min(1, (v.y - lowerFloor.floorY) / ySpan));
+            screenPts.push({ x: this.wx(v.x), y: gapBottom + t * (gapTop - gapBottom) });
+          }
+        } else {
+          screenPts.push({ x: exitSx, y: (gapBottom + gapTop) * 0.5 });
+        }
+        screenPts.push({ x: enterSx, y: upperBounds.y1 + upperBounds.dy });
+      } else {
+        screenPts.push({ x: exitSx, y: upperBounds.y1 + upperBounds.dy });
+        const ySpan = lowerFloor.floorY - upperFloor.floorY;
+        if (link.via.length >= 2 && Math.abs(ySpan) > 1e-4) {
+          for (const v of link.via) {
+            const t = Math.max(0, Math.min(1, (v.y - upperFloor.floorY) / ySpan));
+            screenPts.push({ x: this.wx(v.x), y: gapTop + t * (gapBottom - gapTop) });
+          }
+        } else {
+          screenPts.push({ x: exitSx, y: (gapBottom + gapTop) * 0.5 });
+        }
+        screenPts.push({ x: enterSx, y: lowerBounds.y0 + lowerBounds.dy });
+      }
+
+      screenPts.push({ x: enterSx, y: enterSy });
+      this.drawRouteScreenPath(ctx, dpr, screenPts);
+      this.drawStepTicksInGap(ctx, dpr, screenPts, gapTop, gapBottom);
+    }
+  }
+
+  private drawPlateSlab(
+    ctx: CanvasRenderingContext2D,
+    bounds: { x0: number; y0: number; x1: number; y1: number; thickness: number },
+    dpr: number,
+    isActive: boolean,
+    title: string,
+  ): void {
+    const { x0, y0, x1, y1, thickness } = bounds;
+    const cardW = x1 - x0;
+    const cardH = y1 - y0;
+
+    ctx.fillStyle = 'rgba(15,23,42,0.06)';
+    ctx.fillRect(x0 + 3 * dpr, y1 + thickness + 2 * dpr, cardW, 5 * dpr);
+
+    ctx.fillStyle = '#cbd5e1';
+    ctx.fillRect(x0, y1, cardW, thickness);
+    ctx.fillStyle = '#e2e8f0';
+    ctx.fillRect(x0, y1, cardW, Math.max(2, thickness * 0.45));
+
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(x0, y0, cardW, cardH);
+
+    ctx.strokeStyle = isActive ? FLOOR2D_STYLE.accent : '#94a3b8';
+    ctx.lineWidth = isActive ? 2.5 * dpr : 1.5 * dpr;
+    ctx.strokeRect(x0 + 0.5, y0 + 0.5, cardW - 1, cardH - 1);
+
+    const fontSize = Math.max(10, 12 * dpr);
+    ctx.font = `700 ${fontSize}px -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif`;
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    ctx.fillStyle = '#1e293b';
+    ctx.fillText(title, x0 + 10 * dpr, y0 + 8 * dpr);
+  }
+
+  private walkForFloorLevel(floor: FloorLevel): Uint8Array | null {
+    if (!this.map) return null;
+    const saved = getFloorWalkGrid(this.map, floor);
+    if (saved) return saved;
+    if (floor.id === this.activeFloorId && this.editWalk) return this.editWalk;
+    return null;
+  }
+
+  private drawPoisOnFloor(ctx: CanvasRenderingContext2D, dpr: number, floor: FloorLevel): void {
+    const fontSize = Math.max(9, 11 * dpr);
+    ctx.font = `600 ${fontSize}px -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif`;
+    ctx.textBaseline = 'middle';
+    const sliceY = floor.floorY;
+
+    const drawEndpoint = (id: string, color: string) => {
+      const ep = this.resolveRouteEndpoint(id, sliceY);
+      if (!ep) return;
+      if (Math.abs(nearestFloorYForPoi(ep.y, this.editFloors) - floor.floorY) > 0.2) return;
+      const px = this.wx(ep.x);
+      const py = this.wz(ep.z);
+      const label = truncateLabel(ep.name, 22);
+      this.drawPoiMarker(ctx, px, py, color, dpr, 7);
+      ctx.textAlign = 'center';
+      ctx.fillStyle = color;
+      ctx.fillText(label, px, py - 16 * dpr);
+    };
+
+    if (this.originId) drawEndpoint(this.originId, FLOOR2D_STYLE.origin);
+    if (this.destId && this.destId !== this.originId) {
+      drawEndpoint(this.destId, FLOOR2D_STYLE.destination);
+    }
+
+    for (const poi of this.pois) {
+      if (poi.id === this.originId || poi.id === this.destId) continue;
+      if (Math.abs(nearestFloorYForPoi(poi.y, this.editFloors) - floor.floorY) > 0.2) continue;
+      const px = this.wx(poi.x);
+      const py = this.wz(poi.z);
+      const label = truncateLabel(poi.name, 22);
+      this.drawPoiMarker(ctx, px, py, FLOOR2D_STYLE.poiMarker, dpr);
+      ctx.textAlign = 'left';
+      ctx.fillStyle = FLOOR2D_STYLE.poiLabel;
+      ctx.fillText(label, px + 13 * dpr, py);
+    }
+  }
+
+  private drawStackedFloorsView(ctx: CanvasRenderingContext2D, dpr: number): void {
+    if (!this.map) return;
+    const floors = this.sortedFloors();
+    const mapH = this.map.maxZ - this.map.minZ;
+    const gapPx = this.stackGapPx(dpr);
+    const pad = this.platePadPx(dpr);
+
+    for (let i = 0; i < floors.length; i++) {
+      const floor = floors[i];
+      const dy = this.stackLayerDy(i, mapH, gapPx, dpr);
+      const bounds = this.plateBounds(i, mapH, gapPx, dpr);
+      const isActive = floor.id === this.activeFloorId;
+      const preview = previewMapForFloor(this.map, floor, this.editFloors);
+      const walk = this.walkForFloorLevel(floor);
+      const objects = floor.objects ?? (isActive ? this.editObjects : []);
+      const zones = floor.zones ?? (isActive ? this.editZones : []);
+      const title = floor.label.trim() || `Floor ${i + 1}`;
+
+      ctx.save();
+      ctx.translate(0, dy);
+      this.drawPlateSlab(ctx, bounds, dpr, isActive, title);
+
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(bounds.x0 + pad * 0.25, bounds.y0 + pad * 0.25, bounds.x1 - bounds.x0 - pad * 0.5, bounds.y1 - bounds.y0 - pad * 0.5);
+      ctx.clip();
+
+      if (walk) this.drawWalkGrid(ctx, walk);
+      this.drawStores(ctx, preview, dpr);
+      this.drawWalls(ctx, preview, dpr);
+      this.drawObjects(ctx, dpr, objects);
+      this.drawZones(ctx, dpr, zones);
+
+      this.drawRouteDebugForFloor(ctx, dpr, floor.id);
+      const seg = this.routeSegments.find((s) => s.floorId === floor.id);
+      if (seg) {
+        const trimmed = this.trimPathForFloor(floor.id, seg.path);
+        this.drawRouteOnPath(ctx, dpr, trimmed);
+      }
+      this.drawRouteBreakPoints(ctx, dpr, floor.id);
+
+      this.drawPoisOnFloor(ctx, dpr, floor);
+      ctx.restore();
+      ctx.restore();
+    }
+
+    this.drawGapStairRoutes(ctx, dpr, floors, mapH, gapPx);
+    this.drawRouteDebugLegend(ctx, dpr);
+
+    if (this.routeError) {
+      ctx.font = `600 ${Math.max(10, 12 * dpr)}px -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif`;
+      ctx.textAlign = 'center';
+      ctx.fillStyle = '#b91c1c';
+      ctx.fillText(this.routeError, this.canvas.width * 0.5, this.canvas.height - 18 * dpr);
+    }
   }
 
   private drawPoiMarker(
@@ -1638,10 +2371,13 @@ export class Floor2DView {
     ctx.font = `600 ${fontSize}px -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif`;
     ctx.textBaseline = 'middle';
     const sliceY = this.map?.sliceY ?? 0;
+    const visible = new Set(this.poisForDisplay().map((p) => p.id));
 
     const drawEndpoint = (id: string, color: string) => {
       const ep = this.resolveRouteEndpoint(id, sliceY);
       if (!ep) return;
+      const poi = this.pois.find((p) => p.id === id);
+      if (poi && !visible.has(id)) return;
       const px = this.wx(ep.x);
       const py = this.wz(ep.z);
       const label = truncateLabel(ep.name, 22);
@@ -1655,9 +2391,9 @@ export class Floor2DView {
     if (this.destId && this.destId !== this.originId) {
       drawEndpoint(this.destId, FLOOR2D_STYLE.destination);
     }
-
     for (const poi of this.pois) {
       if (poi.id === this.originId || poi.id === this.destId) continue;
+      if (!visible.has(poi.id)) continue;
       const px = this.wx(poi.x);
       const py = this.wz(poi.z);
       const maxLen = 22;
@@ -1680,6 +2416,12 @@ export class Floor2DView {
     ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
     ctx.fillStyle = FLOOR2D_STYLE.background;
     ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
+
+    if (this.usesStackedPlate3d()) {
+      this.enableMultiFloor3dView();
+      this.syncScene3d(false);
+      return;
+    }
 
     this.drawWalkGrid(ctx);
     this.drawNavMesh(ctx, dpr);

@@ -2,7 +2,8 @@ import * as THREE from 'three';
 import type { NavMesh } from 'recast-navigation';
 import { computeNavigationRoutePath } from './navmeshSnap';
 
-const PATH_COLOR = 0x8b0000;
+const PATH_COLOR = 0x2563eb;
+const PATH_TUBE_RADIUS = 0.15;
 const PATH_LINE_LIFT_Y = 0.08;
 const CRUMB_GAP = 0.09;
 const CRUMB_RADIUS = 0.12;
@@ -50,15 +51,44 @@ function liftPathPoints(pathPoints: THREE.Vector3[], liftY: number): THREE.Vecto
   return pathPoints.map((p) => new THREE.Vector3(p.x, p.y + liftY, p.z));
 }
 
-function createPathLine(pathPoints: THREE.Vector3[]): THREE.Line | null {
+function disposePathMesh(obj: THREE.Object3D): void {
+  let sharedMat: THREE.Material | null = null;
+  obj.traverse((child) => {
+    if (child instanceof THREE.Mesh) {
+      child.geometry.dispose();
+      const m = child.material;
+      if (!sharedMat && m && !Array.isArray(m)) sharedMat = m;
+    }
+  });
+  sharedMat?.dispose();
+}
+
+function createPathMesh(pathPoints: THREE.Vector3[]): THREE.Group | null {
   if (!pathPoints || pathPoints.length < 2) return null;
-  const geo = new THREE.BufferGeometry().setFromPoints(liftPathPoints(pathPoints, PATH_LINE_LIFT_Y));
-  const mat = new THREE.LineBasicMaterial({ color: PATH_COLOR, depthTest: true, depthWrite: true });
-  const line = new THREE.Line(geo, mat);
-  line.name = 'NavPathLine';
-  line.renderOrder = 4;
-  line.frustumCulled = false;
-  return line;
+  const group = new THREE.Group();
+  group.name = 'NavPathLine';
+  group.frustumCulled = false;
+  const mat = new THREE.MeshBasicMaterial({ color: PATH_COLOR });
+  const lifted = liftPathPoints(pathPoints, PATH_LINE_LIFT_Y);
+  const up = new THREE.Vector3(0, 1, 0);
+  for (let i = 0; i < lifted.length - 1; i++) {
+    const a = lifted[i];
+    const b = lifted[i + 1];
+    const delta = b.clone().sub(a);
+    const len = delta.length();
+    if (len < 1e-5) continue;
+    const mid = a.clone().add(b).multiplyScalar(0.5);
+    const quat = new THREE.Quaternion().setFromUnitVectors(up, delta.clone().normalize());
+    const seg = new THREE.Mesh(
+      new THREE.CylinderGeometry(PATH_TUBE_RADIUS, PATH_TUBE_RADIUS, len, 10),
+      mat,
+    );
+    seg.position.copy(mid);
+    seg.quaternion.copy(quat);
+    seg.renderOrder = 4;
+    group.add(seg);
+  }
+  return group.children.length > 0 ? group : null;
 }
 
 function createBreadcrumbInstanced() {
@@ -187,7 +217,7 @@ export function createRouteAndBreadcrumbs(
   originMarker.visible = !hideSpheres;
   destMarker.visible = !hideSpheres;
   group.add(originMarker, destMarker);
-  let routeLine: THREE.Line | null = null;
+  let routeLine: THREE.Group | null = null;
   const destination = new THREE.Vector3(0, 0, 3);
   const state = { pathPoints: [] as THREE.Vector3[], valid: false, error: null as string | null };
   const crumbs = createBreadcrumbInstanced();
@@ -200,8 +230,7 @@ export function createRouteAndBreadcrumbs(
   function rebuildLine() {
     if (routeLine) {
       group.remove(routeLine);
-      routeLine.geometry.dispose();
-      (routeLine.material as THREE.Material).dispose();
+      disposePathMesh(routeLine);
       routeLine = null;
     }
     const originPt = options.getOrigin ? getOrigin().clone() : origin.clone();
@@ -224,7 +253,7 @@ export function createRouteAndBreadcrumbs(
     state.pathPoints = pathPts;
     state.valid = true;
     state.error = null;
-    routeLine = createPathLine(pathPts);
+    routeLine = createPathMesh(pathPts);
     if (routeLine) group.add(routeLine);
     if (!hideCrumbs) {
       updateBreadcrumbsAlongPath(crumbs.baseMesh, pathPts, CRUMB_GAP);
@@ -234,10 +263,7 @@ export function createRouteAndBreadcrumbs(
   }
 
   function dispose() {
-    if (routeLine) {
-      routeLine.geometry.dispose();
-      (routeLine.material as THREE.Material).dispose();
-    }
+    if (routeLine) disposePathMesh(routeLine);
     crumbs.baseGeo.dispose();
     crumbs.outlineGeo.dispose();
     crumbs.baseMat.dispose();

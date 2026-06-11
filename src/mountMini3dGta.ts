@@ -28,7 +28,6 @@ import { createRouteAndBreadcrumbs, type RouteAndBreadcrumbsHandle } from './rou
 import {
   buildDemoPoisFromMap,
   fillRouteEndpointSelect,
-  filterPoisByFloorY,
   findNavMapPoi,
   getNavMapPois,
   setNavMapPois,
@@ -507,20 +506,23 @@ export function mountMini3dGta(
     return floor2dView?.getRouteFloors() ?? [];
   }
 
-  /** POIs whose Y is nearest to the active floor (or current slice when previewing). */
-  function getPoisForActiveFloor(): ReturnType<typeof getNavMapPois> {
+  /** POIs for origin/destination dropdowns — filtered by active floor or all when viewing every floor. */
+  function getPoisForRouteUi(): ReturnType<typeof getNavMapPois> {
     const all = getNavMapPois();
-    if (!use2d) return all;
-    const levels = floor2dView?.getFloorLevels() ?? [];
-    const active = floor2dView?.getActiveFloor();
-    const targetY = active?.floorY ?? floorSliceY;
-    return filterPoisByFloorY(all, targetY, levels);
+    if (!use2d || !floor2dView) return all;
+    return floor2dView.poisForDisplay(getNavMapPois());
+  }
+
+  /** POIs shown on the map for the active floor selection. */
+  function getPoisForActiveFloor(): ReturnType<typeof getNavMapPois> {
+    if (!use2d || !floor2dView) return getNavMapPois();
+    return floor2dView.poisForDisplay(getNavMapPois());
   }
 
   function syncFloor2dPoiDisplay() {
     if (!use2d || !floor2dView || !originSelect || !destSelect) return;
-    const pois = getPoisForActiveFloor();
-    floor2dView.setPois(pois, originSelect.value, destSelect.value);
+    floor2dView.setPois(getNavMapPois(), originSelect.value, destSelect.value);
+    floor2dView.draw();
   }
 
   function updateMapOverlayPositions() {
@@ -578,13 +580,32 @@ export function mountMini3dGta(
 
   function refreshPoiSelects() {
     if (!originSelect || !destSelect) return;
-    const pois = getPoisForActiveFloor();
+    const pois = getPoisForRouteUi();
     const zones = getRouteZonesForSelect();
     const floors = getRouteFloorsForSelect();
+    const floorLevels = floor2dView?.getFloorLevels() ?? [];
     const o = originSelect.value;
     const d = destSelect.value;
-    fillRouteEndpointSelect(originSelect, 'Choose origin…', pois, zones, floors, d || undefined, o);
-    fillRouteEndpointSelect(destSelect, 'Choose destination…', pois, zones, floors, o || undefined, d);
+    fillRouteEndpointSelect(
+      originSelect,
+      'Choose origin…',
+      pois,
+      zones,
+      floors,
+      d || undefined,
+      o,
+      floorLevels,
+    );
+    fillRouteEndpointSelect(
+      destSelect,
+      'Choose destination…',
+      pois,
+      zones,
+      floors,
+      o || undefined,
+      d,
+      floorLevels,
+    );
     syncFloor2dPoiDisplay();
     applyPoiSelectionsFn?.();
   }
@@ -629,12 +650,10 @@ export function mountMini3dGta(
       syncFloor2dPoiDisplay();
       return { valid: false, error: null };
     }
-    const active = floor2dView.getActiveFloor();
-    const routeY = active?.floorY ?? floorSliceY;
-    const result = floor2dView.computeRoutePath(o.x, o.z, d.x, d.z, routeY);
-    floor2dView.setPath(result.path);
+    floor2dView.flushCurrentFloorState();
+    const result = floor2dView.computeAndSetRoute(getNavMesh(), o, d);
     syncFloor2dPoiDisplay();
-    return { valid: result.path.length >= 2, error: result.error ?? null };
+    return { valid: result.valid, error: result.error ?? null };
   }
 
   function updatePaintFloorTitle() {
@@ -647,6 +666,11 @@ export function mountMini3dGta(
       floor2dView = new Floor2DView(mountRoot);
       floor2dView.setOnToolChange((tool: Floor2DTool) => {
         panBtn.classList.toggle('mini3dgta-fs-tool--active', tool === 'pan');
+        if (tool !== 'pan') {
+          walls3dBtn.classList.remove('mini3dgta-fs-tool--active');
+        } else if (floor2dView?.isIso3d()) {
+          walls3dBtn.classList.add('mini3dgta-fs-tool--active');
+        }
         paintFloorBtn.classList.toggle('mini3dgta-fs-tool--active', tool === 'add');
         cutBtn.classList.toggle('mini3dgta-fs-tool--active', tool === 'cut');
         objectBtn.classList.toggle('mini3dgta-fs-tool--active', tool === 'object');
@@ -660,6 +684,7 @@ export function mountMini3dGta(
       });
       floor2dView.setOnFloorActivate((floor) => {
         switchToFloorLevel(floor.floorY, floor.id);
+        refreshPoiSelects();
       });
       floor2dView.setOnZoneSelectionChange((zoneId) => {
         deleteZoneBtn.disabled = !zoneId;
@@ -676,8 +701,17 @@ export function mountMini3dGta(
         applyPoiSelectionsFn?.();
       });
       floor2dView.setOnFloorsChange(() => {
+        floor2dView?.fit();
         refreshPoiSelects();
         applyPoiSelectionsFn?.();
+        floor2dView?.draw();
+      });
+      floor2dView.setOnViewStackChange(() => {
+        walls3dBtn.classList.toggle('mini3dgta-fs-tool--active', floor2dView?.isIso3d() ?? false);
+        refreshPoiSelects();
+      });
+      floor2dView.setOnIso3dChange((on) => {
+        walls3dBtn.classList.toggle('mini3dgta-fs-tool--active', on);
       });
       floor2dView.setOnRouteRebuild(() => {
         applyPoiSelectionsFn?.();
@@ -922,27 +956,30 @@ export function mountMini3dGta(
 
         const finishNavAndRoute = async () => {
           if (use2d) {
+            navMeshBuilding = true;
+            navMeshBtn.disabled = true;
+            setNotify('Nav mesh', 'Building walkable nav mesh…', 'loading');
+            try {
+              const navResult = await ensureNavMeshForMap(mapRoot);
+              if (!navResult.success) {
+                setNotify('Nav mesh failed', navResult.error || 'Unknown error', 'error');
+              }
+              refreshNavMeshOverlay();
+            } catch (err) {
+              console.warn('[navmesh] build failed:', err);
+              setNotify('Nav mesh failed', err instanceof Error ? err.message : String(err), 'error');
+            } finally {
+              navMeshBuilding = false;
+              navMeshBtn.disabled = false;
+            }
             attachRoute();
             const route = rebuildFloor2dRoute();
             const hasRouteEndpoints = Boolean(originSelect?.value && destSelect?.value);
             if (hasRouteEndpoints && !route.valid) {
-              setNotify('Path', route.error || 'Could not build path on floor', 'error');
+              setNotify('Path', route.error || 'Could not build path on nav mesh', 'error');
               return;
             }
-            setNotify('Ready', '2D floor navigation ready', 'done');
-            void (async () => {
-              navMeshBuilding = true;
-              navMeshBtn.disabled = true;
-              try {
-                await ensureNavMeshForMap(mapRoot);
-                refreshNavMeshOverlay();
-              } catch (err) {
-                console.warn('[navmesh] overlay build failed:', err);
-              } finally {
-                navMeshBuilding = false;
-                navMeshBtn.disabled = false;
-              }
-            })();
+            setNotify('Ready', 'Floor navigation ready (nav mesh route)', 'done');
             return;
           }
 
