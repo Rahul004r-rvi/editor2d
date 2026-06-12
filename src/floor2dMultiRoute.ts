@@ -1,7 +1,13 @@
 import type { NavMesh } from 'recast-navigation';
 import type { Floor2DMap, FloorBlock, FloorLevel } from './floor2d';
 import { applyWalkGridEdits } from './floor2d';
-import { findPathOnFloorGrid, snapWorldToWalkCell, type FloorPathPoint } from './floor2dRoute';
+import {
+  buildFloorNavGrid,
+  cellCenter,
+  findPathOnFloorGrid,
+  snapWorldToWalkCell,
+  type FloorPathPoint,
+} from './floor2dRoute';
 import { floorLevelForPoiY } from './pois';
 import { computeNavigationRoutePath } from './navmeshSnap';
 import { NAV_MESH_QUERY_HALF_EXTENTS } from './config';
@@ -45,6 +51,28 @@ export type MultiFloorRoutePlan = {
 
 const STAIR_Y_MARGIN = 0.35;
 const LANDING_MISMATCH = 1.75;
+/** Min horizontal span between stair mouths — below this is a vertical shortcut (not real stairs). */
+const MIN_STAIR_XZ = 0.85;
+/** POI closer than this to a vertical mouth pair is treated as a forbidden plumb-line drop. */
+const POI_PLUMB_RADIUS = 2.0;
+const STAIR_MOUTH_FLOOR_SAMPLES = 96;
+const STAIR_PORTAL_PROBE_LIMIT = 64;
+const STAIR_PORTAL_GRID_CANDIDATES = 12;
+
+type StairPortal = {
+  from: { x: number; z: number };
+  to: { x: number; z: number };
+};
+
+const stairPortalCache = new Map<string, StairPortal>();
+
+export function clearStairPortalCache(): void {
+  stairPortalCache.clear();
+}
+
+function stairPortalCacheKey(fromFloorId: string, toFloorId: string): string {
+  return `${fromFloorId}\0${toFloorId}`;
+}
 
 type Vec3 = { x: number; y: number; z: number };
 
@@ -95,6 +123,112 @@ function reversePath(path: FloorPathPoint[]): FloorPathPoint[] {
   return [...path].reverse();
 }
 
+function pathXZ(path: FloorPathPoint[]): { x: number; z: number }[] {
+  return path.map((p) => ({ x: p.x, z: p.z }));
+}
+
+function dedupePathPoints(path: { x: number; z: number }[]): { x: number; z: number }[] {
+  if (path.length < 2) return path;
+  const out = [path[0]];
+  for (let i = 1; i < path.length; i++) {
+    const prev = out[out.length - 1];
+    if (distXZ(path[i], prev) > 0.05) out.push(path[i]);
+  }
+  return out.length >= 2 ? out : path;
+}
+
+function setPathEndpoint(
+  path: { x: number; z: number }[],
+  point: { x: number; z: number },
+  end: 'start' | 'end',
+): { x: number; z: number }[] {
+  if (path.length === 0) return [{ ...point }];
+  const out = path.map((p) => ({ ...p }));
+  const i = end === 'start' ? 0 : out.length - 1;
+  out[i] = { x: point.x, z: point.z };
+  return out;
+}
+
+/** Full per-floor path for 3D plates — snap to stair mouths, no nearest-index trim. */
+export function pathForFloor3dPlate(
+  floorId: string,
+  segment: FloorRouteSegment | undefined,
+  connectors: FloorRouteConnector[],
+): { x: number; z: number }[] {
+  if (!segment || segment.path.length < 2) return [];
+  let path = pathXZ(segment.path);
+
+  for (const link of connectors) {
+    if (link.toFloorId === floorId) {
+      path = setPathEndpoint(path, { x: link.to.x, z: link.to.z }, 'start');
+    }
+    if (link.fromFloorId === floorId) {
+      path = setPathEndpoint(path, { x: link.from.x, z: link.from.z }, 'end');
+    }
+  }
+
+  return dedupePathPoints(path);
+}
+
+function nearestIndexTowardStart(
+  path: { x: number; z: number }[],
+  x: number,
+  z: number,
+): number {
+  const limit = Math.min(path.length, Math.max(3, Math.ceil(path.length * 0.45)));
+  let best = 0;
+  let bestD = distXZ(path[0], { x, z });
+  for (let i = 1; i < limit; i++) {
+    const d = distXZ(path[i], { x, z });
+    if (d < bestD - 0.02) {
+      bestD = d;
+      best = i;
+    }
+  }
+  return best;
+}
+
+function nearestIndexTowardEnd(
+  path: { x: number; z: number }[],
+  x: number,
+  z: number,
+): number {
+  const start = Math.max(0, path.length - Math.max(3, Math.ceil(path.length * 0.45)));
+  let best = path.length - 1;
+  let bestD = distXZ(path[best], { x, z });
+  for (let i = start; i < path.length - 1; i++) {
+    const d = distXZ(path[i], { x, z });
+    if (d < bestD - 0.02 || (d <= bestD + 0.05 && i > best)) {
+      bestD = d;
+      best = i;
+    }
+  }
+  return best;
+}
+
+/** Trim a floor segment for 2D plate drawing (inbound mouth first, then outbound). */
+export function trimPathForFloorPlate(
+  floorId: string,
+  path: FloorPathPoint[],
+  connectors: FloorRouteConnector[],
+): FloorPathPoint[] {
+  if (path.length < 2) return path;
+  let out = [...path];
+
+  for (const link of connectors) {
+    if (link.toFloorId !== floorId) continue;
+    const idx = nearestIndexTowardStart(out, link.to.x, link.to.z);
+    out = out.slice(idx);
+  }
+  for (const link of connectors) {
+    if (link.fromFloorId !== floorId) continue;
+    const idx = nearestIndexTowardEnd(out, link.from.x, link.from.z);
+    out = out.slice(0, idx + 1);
+  }
+
+  return out.length >= 2 ? out : path;
+}
+
 function multiFloorHalfExtents(floors: FloorLevel[]): { x: number; y: number; z: number } {
   const ys = floors.map((f) => f.floorY);
   const span = ys.length ? Math.max(...ys) - Math.min(...ys) : 8;
@@ -131,14 +265,553 @@ function extractConnectorEndpoints(
   return connectors;
 }
 
+function resampleStairPoints(a: Vec3, b: Vec3, steps: number): Vec3[] {
+  const out: Vec3[] = [];
+  for (let i = 1; i < steps; i++) {
+    const t = i / steps;
+    out.push({
+      x: a.x + (b.x - a.x) * t,
+      y: a.y + (b.y - a.y) * t,
+      z: a.z + (b.z - a.z) * t,
+    });
+  }
+  return out;
+}
+
 function stairViaPoints(path: Vec3[], fromFloor: FloorLevel, toFloor: FloorLevel): Vec3[] {
-  if (path.length < 2) return path;
+  if (path.length < 2) return [];
   const low = Math.min(fromFloor.floorY, toFloor.floorY);
   const high = Math.max(fromFloor.floorY, toFloor.floorY);
-  if (high - low < STAIR_Y_MARGIN * 2) return path.slice(1, -1);
 
   const onSlope = path.filter((p) => p.y > low + STAIR_Y_MARGIN && p.y < high - STAIR_Y_MARGIN);
-  return onSlope.length >= 2 ? onSlope : path.slice(1, -1);
+  if (onSlope.length >= 2) return onSlope;
+
+  const inner = path.slice(1, -1);
+  if (inner.length >= 2) return inner;
+  if (inner.length === 1) return inner;
+
+  return resampleStairPoints(path[0], path[path.length - 1], 10);
+}
+
+/** Slope points from the full O→D nav-mesh discovery path (follows real stairs). */
+function extractDiscoveryStairVia(
+  path: Vec3[],
+  fromFloorId: string,
+  toFloorId: string,
+  floors: FloorLevel[],
+): Vec3[] {
+  for (let i = 1; i < path.length; i++) {
+    const prevF = floorForY(path[i - 1].y, floors);
+    const curF = floorForY(path[i].y, floors);
+    if (prevF?.id !== fromFloorId || curF?.id !== toFloorId) continue;
+
+    let start = i - 1;
+    for (let s = i - 2; s >= 0; s--) {
+      if (floorForY(path[s].y, floors)?.id === fromFloorId) start = s;
+      else break;
+    }
+    let end = i;
+    for (let e = i + 1; e < path.length; e++) {
+      if (floorForY(path[e].y, floors)?.id === toFloorId) end = e;
+      else break;
+    }
+
+    const chunk = path.slice(start, end + 1);
+    if (chunk.length >= 3) return chunk.slice(1, -1);
+    if (chunk.length === 2) return resampleStairPoints(chunk[0], chunk[1], 10);
+    return [];
+  }
+
+  const fromFloor = floors.find((f) => f.id === fromFloorId);
+  const toFloor = floors.find((f) => f.id === toFloorId);
+  if (!fromFloor || !toFloor) return [];
+
+  const lo = Math.min(fromFloor.floorY, toFloor.floorY);
+  const hi = Math.max(fromFloor.floorY, toFloor.floorY);
+  const between = path.filter((p) => p.y >= lo - 0.05 && p.y <= hi + 0.05);
+  if (between.length >= 3) return between.slice(1, -1);
+  if (between.length === 2) return resampleStairPoints(between[0], between[1], 10);
+  return [];
+}
+
+function pathXZTravel(pts: { x: number; z: number }[]): number {
+  return pts.reduce((sum, p, i) => (i === 0 ? 0 : sum + distXZ(p, pts[i - 1])), 0);
+}
+
+function isVerticalStairShortcut(
+  from: { x: number; z: number },
+  to: { x: number; z: number },
+): boolean {
+  return distXZ(from, to) < MIN_STAIR_XZ;
+}
+
+function stairNavHasSlope(
+  stair: FloorRouteConnector,
+  fromFloor: FloorLevel,
+  toFloor: FloorLevel,
+): boolean {
+  void fromFloor;
+  void toFloor;
+  const mouthXZ = distXZ(stair.from, stair.to);
+  const viaXZ = pathXZTravel(stair.via);
+  return mouthXZ >= MIN_STAIR_XZ || viaXZ >= MIN_STAIR_XZ;
+}
+
+/** Nav-mesh hole under a POI (Primary suite / Closet) — same XZ drop, not real stairs. */
+function isPlumbDropAtPoi(
+  origin: Vec3,
+  destination: Vec3,
+  from: { x: number; z: number },
+  to: { x: number; z: number },
+  fromFloor: FloorLevel,
+  toFloor: FloorLevel,
+): boolean {
+  if (!isVerticalStairShortcut(from, to)) return false;
+  const originOnFrom = Math.abs(origin.y - fromFloor.floorY) < 0.6;
+  const destOnTo = Math.abs(destination.y - toFloor.floorY) < 0.6;
+  if (originOnFrom && distXZ(origin, from) < POI_PLUMB_RADIUS) return true;
+  if (destOnTo && distXZ(destination, to) < POI_PLUMB_RADIUS) return true;
+  return false;
+}
+
+function isRejectedStairMouthPair(
+  origin: Vec3,
+  destination: Vec3,
+  from: { x: number; z: number },
+  to: { x: number; z: number },
+  fromFloor: FloorLevel,
+  toFloor: FloorLevel,
+): boolean {
+  if (isPlumbDropAtPoi(origin, destination, from, to, fromFloor, toFloor)) return true;
+  if (isVerticalStairShortcut(from, to)) return true;
+  return false;
+}
+
+function floorGridPathLength(
+  map: Floor2DMap,
+  floor: FloorLevel,
+  floors: FloorLevel[],
+  startX: number,
+  startZ: number,
+  endX: number,
+  endZ: number,
+  activeWalk: Uint8Array | null,
+  activeFloorId: string | null,
+): number {
+  const out = routeOnFloorGrid(
+    map,
+    floor,
+    floors,
+    startX,
+    startZ,
+    endX,
+    endZ,
+    activeWalk,
+    activeFloorId,
+  );
+  if ('error' in out) return Infinity;
+  if (out.path.length < 2) return Infinity;
+  let len = 0;
+  for (let i = 1; i < out.path.length; i++) {
+    len += distXZ(out.path[i - 1], out.path[i]);
+  }
+  return len;
+}
+
+function sampleAllWalkCells(
+  floorMap: Floor2DMap,
+  nav: Uint8Array,
+  maxSamples: number,
+): { c: number; r: number }[] {
+  const out: { c: number; r: number }[] = [];
+  const total = floorMap.cols * floorMap.rows;
+  const stride = Math.max(1, Math.floor(Math.sqrt(total / maxSamples)));
+  for (let r = 0; r < floorMap.rows; r += stride) {
+    for (let c = 0; c < floorMap.cols; c += stride) {
+      if (nav[r * floorMap.cols + c]) out.push({ c, r });
+    }
+  }
+  return out;
+}
+
+/** Last flat point before the slope on upper floor + first flat point after on lower floor. */
+function extractSlopeStairMouths(
+  path: Vec3[],
+  fromFloor: FloorLevel,
+  toFloor: FloorLevel,
+  floors: FloorLevel[],
+): Omit<FloorRouteConnector, 'via'> | null {
+  const lo = Math.min(fromFloor.floorY, toFloor.floorY);
+  const hi = Math.max(fromFloor.floorY, toFloor.floorY);
+
+  let slopeStart = -1;
+  let slopeEnd = -1;
+  for (let i = 0; i < path.length; i++) {
+    const y = path[i].y;
+    if (y > lo + STAIR_Y_MARGIN && y < hi - STAIR_Y_MARGIN) {
+      if (slopeStart < 0) slopeStart = i;
+      slopeEnd = i;
+    }
+  }
+  if (slopeStart < 0) return null;
+
+  let topIdx = slopeStart - 1;
+  while (topIdx >= 0 && floorForY(path[topIdx].y, floors)?.id !== fromFloor.id) topIdx--;
+  const topMouth = topIdx >= 0 ? path[topIdx] : path[slopeStart];
+
+  let bottomIdx = slopeEnd + 1;
+  while (bottomIdx < path.length && floorForY(path[bottomIdx].y, floors)?.id !== toFloor.id) {
+    bottomIdx++;
+  }
+  const bottomMouth =
+    bottomIdx < path.length ? path[bottomIdx] : path[slopeEnd];
+
+  const from = { x: topMouth.x, z: topMouth.z };
+  const to = { x: bottomMouth.x, z: bottomMouth.z };
+  if (isVerticalStairShortcut(from, to) && pathXZTravel(path.slice(slopeStart, slopeEnd + 1)) < MIN_STAIR_XZ) {
+    return null;
+  }
+
+  return {
+    fromFloorId: fromFloor.id,
+    toFloorId: toFloor.id,
+    from,
+    to,
+  };
+}
+
+function bestTransitionFromDiscovery(
+  path: Vec3[],
+  fromFloor: FloorLevel,
+  toFloor: FloorLevel,
+  floors: FloorLevel[],
+): Omit<FloorRouteConnector, 'via'> | null {
+  let best: Omit<FloorRouteConnector, 'via'> | null = null;
+  let bestSpan = 0;
+
+  for (let i = 1; i < path.length; i++) {
+    const prevF = floorForY(path[i - 1].y, floors);
+    const curF = floorForY(path[i].y, floors);
+    if (prevF?.id !== fromFloor.id || curF?.id !== toFloor.id) continue;
+
+    const from = { x: path[i - 1].x, z: path[i - 1].z };
+    const to = { x: path[i].x, z: path[i].z };
+    const span = distXZ(from, to);
+    if (span > bestSpan) {
+      bestSpan = span;
+      best = { fromFloorId: fromFloor.id, toFloorId: toFloor.id, from, to };
+    }
+  }
+
+  return bestSpan >= MIN_STAIR_XZ ? best : null;
+}
+
+/** Cached building-wide stair portal (real stairs, independent of POI position). */
+function discoverGlobalStairPortal(
+  navMesh: NavMesh,
+  map: Floor2DMap,
+  floors: FloorLevel[],
+  fromFloor: FloorLevel,
+  toFloor: FloorLevel,
+  activeWalk: Uint8Array | null,
+  activeFloorId: string | null,
+): StairPortal | null {
+  const cacheKey = stairPortalCacheKey(fromFloor.id, toFloor.id);
+  const cached = stairPortalCache.get(cacheKey);
+  if (cached) return cached;
+
+  const fromMap = previewMapForFloor(map, fromFloor, floors);
+  const toMap = previewMapForFloor(map, toFloor, floors);
+  const fromWalk = resolveFloorWalk(map, fromFloor, activeWalk, activeFloorId);
+  const toWalk = resolveFloorWalk(map, toFloor, activeWalk, activeFloorId);
+  if (!fromWalk || !toWalk) return null;
+
+  const fromNav = buildFloorNavGrid(fromMap, fromWalk, fromFloor.objects ?? []);
+  const toNav = buildFloorNavGrid(toMap, toWalk, toFloor.objects ?? []);
+
+  const upperCells = sampleAllWalkCells(fromMap, fromNav, STAIR_MOUTH_FLOOR_SAMPLES);
+  const lowerCells = sampleAllWalkCells(toMap, toNav, STAIR_MOUTH_FLOOR_SAMPLES);
+  if (upperCells.length === 0 || lowerCells.length === 0) return null;
+
+  const upperStride = Math.max(1, Math.ceil(upperCells.length / STAIR_PORTAL_GRID_CANDIDATES));
+  const lowerStride = Math.max(1, Math.ceil(lowerCells.length / STAIR_PORTAL_GRID_CANDIDATES));
+
+  let best: StairPortal | null = null;
+  let bestSpan = 0;
+  let probes = 0;
+
+  for (let ui = 0; ui < upperCells.length && probes < STAIR_PORTAL_PROBE_LIMIT; ui += upperStride) {
+    const u = cellCenter(fromMap, upperCells[ui].c, upperCells[ui].r);
+    for (let li = 0; li < lowerCells.length && probes < STAIR_PORTAL_PROBE_LIMIT; li += lowerStride) {
+      probes++;
+      const l = cellCenter(toMap, lowerCells[li].c, lowerCells[li].r);
+      if (isVerticalStairShortcut(u, l)) continue;
+
+      const stair = computeStairNavPath(navMesh, floors, {
+        fromFloorId: fromFloor.id,
+        toFloorId: toFloor.id,
+        from: u,
+        to: l,
+      });
+      if ('error' in stair) continue;
+      if (!stairNavHasSlope(stair, fromFloor, toFloor)) continue;
+
+      const span = distXZ(u, l) + pathXZTravel(stair.via);
+      if (span > bestSpan) {
+        bestSpan = span;
+        best = { from: u, to: l };
+      }
+    }
+  }
+
+  if (best) stairPortalCache.set(cacheKey, best);
+  return best;
+}
+
+function portalLink(
+  fromFloor: FloorLevel,
+  toFloor: FloorLevel,
+  portal: StairPortal,
+): Omit<FloorRouteConnector, 'via'> {
+  return {
+    fromFloorId: fromFloor.id,
+    toFloorId: toFloor.id,
+    from: portal.from,
+    to: portal.to,
+  };
+}
+
+function portalReachableFromEndpoints(
+  map: Floor2DMap,
+  floors: FloorLevel[],
+  fromFloor: FloorLevel,
+  toFloor: FloorLevel,
+  portal: StairPortal,
+  origin: Vec3,
+  destination: Vec3,
+  activeWalk: Uint8Array | null,
+  activeFloorId: string | null,
+): boolean {
+  const toUpper = floorGridPathLength(
+    map,
+    fromFloor,
+    floors,
+    origin.x,
+    origin.z,
+    portal.from.x,
+    portal.from.z,
+    activeWalk,
+    activeFloorId,
+  );
+  const toLower = floorGridPathLength(
+    map,
+    toFloor,
+    floors,
+    portal.to.x,
+    portal.to.z,
+    destination.x,
+    destination.z,
+    activeWalk,
+    activeFloorId,
+  );
+  return Number.isFinite(toUpper) && Number.isFinite(toLower);
+}
+
+/** Find stair mouths on walk grid when discovery takes a vertical shortcut (e.g. Primary suite). */
+function findStairMouthsViaWalkGrid(
+  navMesh: NavMesh,
+  map: Floor2DMap,
+  floors: FloorLevel[],
+  fromFloor: FloorLevel,
+  toFloor: FloorLevel,
+  origin: Vec3,
+  destination: Vec3,
+  activeWalk: Uint8Array | null,
+  activeFloorId: string | null,
+): Omit<FloorRouteConnector, 'via'> | null {
+  const portal = discoverGlobalStairPortal(
+    navMesh,
+    map,
+    floors,
+    fromFloor,
+    toFloor,
+    activeWalk,
+    activeFloorId,
+  );
+  if (!portal) return null;
+
+  if (
+    !isRejectedStairMouthPair(origin, destination, portal.from, portal.to, fromFloor, toFloor) &&
+    portalReachableFromEndpoints(
+      map,
+      floors,
+      fromFloor,
+      toFloor,
+      portal,
+      origin,
+      destination,
+      activeWalk,
+      activeFloorId,
+    )
+  ) {
+    return portalLink(fromFloor, toFloor, portal);
+  }
+
+  const fromMap = previewMapForFloor(map, fromFloor, floors);
+  const toMap = previewMapForFloor(map, toFloor, floors);
+  const fromWalk = resolveFloorWalk(map, fromFloor, activeWalk, activeFloorId);
+  const toWalk = resolveFloorWalk(map, toFloor, activeWalk, activeFloorId);
+  if (!fromWalk || !toWalk) return null;
+
+  const fromNav = buildFloorNavGrid(fromMap, fromWalk, fromFloor.objects ?? []);
+  const toNav = buildFloorNavGrid(toMap, toWalk, toFloor.objects ?? []);
+  const upperCells = sampleAllWalkCells(fromMap, fromNav, 48);
+  const lowerCells = sampleAllWalkCells(toMap, toNav, 48);
+  const upperStride = Math.max(1, Math.ceil(upperCells.length / 8));
+  const lowerStride = Math.max(1, Math.ceil(lowerCells.length / 8));
+
+  let best: { portal: StairPortal; cost: number } | null = null;
+  let probes = 0;
+
+  for (let ui = 0; ui < upperCells.length && probes < STAIR_PORTAL_PROBE_LIMIT; ui += upperStride) {
+    const u = cellCenter(fromMap, upperCells[ui].c, upperCells[ui].r);
+    for (let li = 0; li < lowerCells.length && probes < STAIR_PORTAL_PROBE_LIMIT; li += lowerStride) {
+      probes++;
+      const lc = lowerCells[li];
+      const l = cellCenter(toMap, lc.c, lc.r);
+      if (isRejectedStairMouthPair(origin, destination, u, l, fromFloor, toFloor)) continue;
+
+      const stair = computeStairNavPath(navMesh, floors, {
+        fromFloorId: fromFloor.id,
+        toFloorId: toFloor.id,
+        from: u,
+        to: l,
+      });
+      if ('error' in stair) continue;
+      if (!stairNavHasSlope(stair, fromFloor, toFloor)) continue;
+
+      const toUpper = floorGridPathLength(
+        map,
+        fromFloor,
+        floors,
+        origin.x,
+        origin.z,
+        u.x,
+        u.z,
+        activeWalk,
+        activeFloorId,
+      );
+      const toLower = floorGridPathLength(
+        map,
+        toFloor,
+        floors,
+        l.x,
+        l.z,
+        destination.x,
+        destination.z,
+        activeWalk,
+        activeFloorId,
+      );
+      if (!Number.isFinite(toUpper) || !Number.isFinite(toLower)) continue;
+
+      const cost = toUpper + toLower;
+      if (!best || cost < best.cost) best = { portal: { from: u, to: l }, cost };
+    }
+  }
+
+  if (!best) {
+    if (
+      portalReachableFromEndpoints(
+        map,
+        floors,
+        fromFloor,
+        toFloor,
+        portal,
+        origin,
+        destination,
+        activeWalk,
+        activeFloorId,
+      )
+    ) {
+      return portalLink(fromFloor, toFloor, portal);
+    }
+    return null;
+  }
+
+  return portalLink(fromFloor, toFloor, best.portal);
+}
+
+/**
+ * Resolve stair mouths before the steps on each floor.
+ * Origin/dest floor legs use floor grid; only the connector uses nav mesh on stairs.
+ */
+function resolveStairMouthLink(
+  discoveryPath: Vec3[],
+  navMesh: NavMesh,
+  map: Floor2DMap,
+  floors: FloorLevel[],
+  fromFloor: FloorLevel,
+  toFloor: FloorLevel,
+  origin: Vec3,
+  destination: Vec3,
+  activeWalk: Uint8Array | null,
+  activeFloorId: string | null,
+): Omit<FloorRouteConnector, 'via'> | { error: string } {
+  const fromSlope = extractSlopeStairMouths(discoveryPath, fromFloor, toFloor, floors);
+  if (
+    fromSlope &&
+    !isRejectedStairMouthPair(
+      origin,
+      destination,
+      fromSlope.from,
+      fromSlope.to,
+      fromFloor,
+      toFloor,
+    )
+  ) {
+    return fromSlope;
+  }
+
+  const fromTransition = bestTransitionFromDiscovery(discoveryPath, fromFloor, toFloor, floors);
+  if (
+    fromTransition &&
+    !isRejectedStairMouthPair(
+      origin,
+      destination,
+      fromTransition.from,
+      fromTransition.to,
+      fromFloor,
+      toFloor,
+    )
+  ) {
+    return fromTransition;
+  }
+
+  const fromGrid = findStairMouthsViaWalkGrid(
+    navMesh,
+    map,
+    floors,
+    fromFloor,
+    toFloor,
+    origin,
+    destination,
+    activeWalk,
+    activeFloorId,
+  );
+  if (fromGrid) return fromGrid;
+
+  return { error: `No stair connection found for ${segmentLabel(fromFloor)} → ${segmentLabel(toFloor)}` };
+}
+
+function mergeStairVia(discoveryPath: Vec3[], meshVia: Vec3[], link: Omit<FloorRouteConnector, 'via'>, floors: FloorLevel[]): Vec3[] {
+  const fromDiscovery = extractDiscoveryStairVia(discoveryPath, link.fromFloorId, link.toFloorId, floors);
+  const xzLength = (pts: Vec3[]) => pathXZTravel(pts);
+
+  if (fromDiscovery.length >= 2 && xzLength(fromDiscovery) > 0.2) return fromDiscovery;
+  if (meshVia.length >= 2 && xzLength(meshVia) > 0.2) return meshVia;
+  if (fromDiscovery.length >= 1) return fromDiscovery;
+  if (meshVia.length >= 1) return meshVia;
+  return [];
 }
 
 function computeStairNavPath(
@@ -436,17 +1109,63 @@ function buildOneWayHybridPlan(
   }
 
   const connectors: FloorRouteConnector[] = [];
-  for (const link of linkEndpoints) {
-    const stair = computeStairNavPath(navMesh, floors, link);
+  for (const rawLink of linkEndpoints) {
+    const fromFloor = floors.find((f) => f.id === rawLink.fromFloorId)!;
+    const toFloor = floors.find((f) => f.id === rawLink.toFloorId)!;
+
+    const mouthLink = resolveStairMouthLink(
+      discovery.path,
+      navMesh,
+      map,
+      floors,
+      fromFloor,
+      toFloor,
+      origin,
+      destination,
+      activeWalk,
+      activeFloorId,
+    );
+    if ('error' in mouthLink) {
+      return { multiFloor: true, segments: [], connectors: [], legs: [], error: mouthLink.error };
+    }
+
+    const stair = computeStairNavPath(navMesh, floors, mouthLink);
     if ('error' in stair) {
       return { multiFloor: true, segments: [], connectors: [], legs: [], error: stair.error };
     }
-    const fromFloor = floors.find((f) => f.id === stair.fromFloorId)!;
-    const toFloor = floors.find((f) => f.id === stair.toFloorId)!;
+    if (!stairNavHasSlope(stair, fromFloor, toFloor)) {
+      return {
+        multiFloor: true,
+        segments: [],
+        connectors: [],
+        legs: [],
+        error: `Stairs from ${segmentLabel(fromFloor)} need a horizontal run — route via the stair mouth, not straight down`,
+      };
+    }
+
+    const snappedFrom = snapLandingToWalk(
+      map,
+      fromFloor,
+      floors,
+      mouthLink.from.x,
+      mouthLink.from.z,
+      activeWalk,
+      activeFloorId,
+    );
+    const snappedTo = snapLandingToWalk(
+      map,
+      toFloor,
+      floors,
+      mouthLink.to.x,
+      mouthLink.to.z,
+      activeWalk,
+      activeFloorId,
+    );
     connectors.push({
       ...stair,
-      from: snapLandingToWalk(map, fromFloor, floors, stair.from.x, stair.from.z, activeWalk, activeFloorId),
-      to: snapLandingToWalk(map, toFloor, floors, stair.to.x, stair.to.z, activeWalk, activeFloorId),
+      from: snappedFrom,
+      to: snappedTo,
+      via: mergeStairVia(discovery.path, stair.via, mouthLink, floors),
     });
   }
 
@@ -618,7 +1337,23 @@ function mergeBidirectionalPlans(
       activeFloorId,
       breaks,
     );
-    if (seg) segments.push(seg);
+    if (seg) {
+      segments.push(seg);
+      continue;
+    }
+    const fallback =
+      forward.segments.find((s) => s.floorId === leg.floor.id) ??
+      reverse.segments.find((s) => s.floorId === leg.floor.id);
+    if (fallback && fallback.path.length >= 2) {
+      breaks.push({
+        floorId: leg.floor.id,
+        floorY: leg.floor.floorY,
+        x: (leg.startX + leg.endX) * 0.5,
+        z: (leg.startZ + leg.endZ) * 0.5,
+        label: 'Used one-way floor path after merge failed',
+      });
+      segments.push(fallback);
+    }
   }
 
   for (const link of connectors) {

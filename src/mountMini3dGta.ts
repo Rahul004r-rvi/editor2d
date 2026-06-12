@@ -12,6 +12,7 @@ import {
   MULTISET_PUBLIC_API,
 } from './config';
 import { buildFloor2DFromMap } from './floor2d';
+import { clearStairPortalCache } from './floor2dMultiRoute';
 import { Floor2DView } from './floor2dView';
 import { fetchAnalyzedFloorPlanFromMap } from './fetchFloorPlan';
 import type { Floor2DTool, ZoneDrawMode } from './floor2dView';
@@ -638,6 +639,17 @@ export function mountMini3dGta(
     scene.add(routeHandle.group);
   }
 
+  let routeRebuildRaf = 0;
+
+  function scheduleRebuildFloor2dRoute(): void {
+    if (!use2d) return;
+    if (routeRebuildRaf) cancelAnimationFrame(routeRebuildRaf);
+    routeRebuildRaf = requestAnimationFrame(() => {
+      routeRebuildRaf = 0;
+      rebuildFloor2dRoute();
+    });
+  }
+
   function rebuildFloor2dRoute(): { valid: boolean; error: string | null } {
     if (!use2d || !floor2dView || !originSelect || !destSelect) {
       floor2dView?.setPath([]);
@@ -960,6 +972,7 @@ export function mountMini3dGta(
             navMeshBtn.disabled = true;
             setNotify('Nav mesh', 'Building walkable nav mesh…', 'loading');
             try {
+              clearStairPortalCache();
               const navResult = await ensureNavMeshForMap(mapRoot);
               if (!navResult.success) {
                 setNotify('Nav mesh failed', navResult.error || 'Unknown error', 'error');
@@ -1067,7 +1080,7 @@ export function mountMini3dGta(
   applyPoiSelectionsFn = () => {
     if (!originSelect || !destSelect) return;
     if (use2d) {
-      rebuildFloor2dRoute();
+      scheduleRebuildFloor2dRoute();
     } else if (routeHandle) {
       const o = originSelect.value ? resolveRouteEndpoint(originSelect.value) : null;
       const d = destSelect.value ? resolveRouteEndpoint(destSelect.value) : null;

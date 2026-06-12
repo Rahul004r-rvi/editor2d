@@ -37,6 +37,7 @@ import {
   computeMultiFloorRoute,
   getFloorWalkGrid,
   previewMapForFloor,
+  trimPathForFloorPlate,
   type FloorRouteConnector,
   type FloorRouteSegment,
   type RouteBreakPoint,
@@ -275,7 +276,11 @@ export class Floor2DView {
         const walk = this.walkForFloorLevel(floor);
         const isActive = floor.id === this.activeFloorId;
         const seg = this.routeSegments.find((s) => s.floorId === floor.id);
-        const path = seg ? this.trimPathForFloor(floor.id, seg.path) : [];
+        const path = seg
+          ? this.trimPathForFloor(floor.id, seg.path).map((p) => ({ x: p.x, z: p.z }))
+          : [];
+        const fwd = this.routeDebugForward.find((s) => s.floorId === floor.id);
+        const rev = this.routeDebugReverse.find((s) => s.floorId === floor.id);
         const platePois = filterPoisByFloorY(this.pois, floor.floorY, this.editFloors);
         return {
           floorId: floor.id,
@@ -285,7 +290,21 @@ export class Floor2DView {
           walk: walk ?? new Uint8Array(0),
           objects: floor.objects ?? (isActive ? this.editObjects : []),
           zones: floor.zones ?? (isActive ? this.editZones : []),
-          path: path.map((p) => ({ x: p.x, z: p.z })),
+          path,
+          debugPaths: [
+            ...(fwd
+              ? [{
+                  color: '#16a34a',
+                  path: this.trimPathForFloor(floor.id, fwd.path).map((p) => ({ x: p.x, z: p.z })),
+                }]
+              : []),
+            ...(rev
+              ? [{
+                  color: '#ea580c',
+                  path: this.trimPathForFloor(floor.id, rev.path).map((p) => ({ x: p.x, z: p.z })),
+                }]
+              : []),
+          ],
           pois: platePois,
         };
       });
@@ -2078,33 +2097,8 @@ export class Floor2DView {
     this.drawRouteDebugLegend(ctx, dpr);
   }
 
-  private nearestPathIndex(path: { x: number; z: number }[], x: number, z: number): number {
-    let best = 0;
-    let bestD = Infinity;
-    for (let i = 0; i < path.length; i++) {
-      const d = (path[i].x - x) ** 2 + (path[i].z - z) ** 2;
-      if (d < bestD) {
-        bestD = d;
-        best = i;
-      }
-    }
-    return best;
-  }
-
   private trimPathForFloor(floorId: string, path: FloorPathPoint[]): FloorPathPoint[] {
-    if (path.length < 2) return path;
-    let out = [...path];
-    for (const link of this.routeConnectors) {
-      if (link.fromFloorId === floorId) {
-        const idx = this.nearestPathIndex(out, link.from.x, link.from.z);
-        out = out.slice(0, idx + 1);
-      }
-      if (link.toFloorId === floorId) {
-        const idx = this.nearestPathIndex(out, link.to.x, link.to.z);
-        out = out.slice(idx);
-      }
-    }
-    return out.length >= 2 ? out : path;
+    return trimPathForFloorPlate(floorId, path, this.routeConnectors);
   }
 
   private drawRouteScreenPath(
@@ -2183,25 +2177,21 @@ export class Floor2DView {
       if (goingUp) {
         screenPts.push({ x: exitSx, y: lowerBounds.y0 + lowerBounds.dy });
         const ySpan = upperFloor.floorY - lowerFloor.floorY;
-        if (link.via.length >= 2 && Math.abs(ySpan) > 1e-4) {
+        if (link.via.length >= 1 && Math.abs(ySpan) > 1e-4) {
           for (const v of link.via) {
             const t = Math.max(0, Math.min(1, (v.y - lowerFloor.floorY) / ySpan));
             screenPts.push({ x: this.wx(v.x), y: gapBottom + t * (gapTop - gapBottom) });
           }
-        } else {
-          screenPts.push({ x: exitSx, y: (gapBottom + gapTop) * 0.5 });
         }
         screenPts.push({ x: enterSx, y: upperBounds.y1 + upperBounds.dy });
       } else {
         screenPts.push({ x: exitSx, y: upperBounds.y1 + upperBounds.dy });
         const ySpan = lowerFloor.floorY - upperFloor.floorY;
-        if (link.via.length >= 2 && Math.abs(ySpan) > 1e-4) {
+        if (link.via.length >= 1 && Math.abs(ySpan) > 1e-4) {
           for (const v of link.via) {
             const t = Math.max(0, Math.min(1, (v.y - upperFloor.floorY) / ySpan));
             screenPts.push({ x: this.wx(v.x), y: gapTop + t * (gapBottom - gapTop) });
           }
-        } else {
-          screenPts.push({ x: exitSx, y: (gapBottom + gapTop) * 0.5 });
         }
         screenPts.push({ x: enterSx, y: lowerBounds.y0 + lowerBounds.dy });
       }

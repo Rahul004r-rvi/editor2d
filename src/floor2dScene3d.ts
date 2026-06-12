@@ -690,6 +690,8 @@ export type Floor2DScene3dFloorLayer = {
   objects: FloorBlock[];
   zones: FloorBlock[];
   path: { x: number; z: number }[];
+  debugPaths?: { color: string; path: { x: number; z: number }[] }[];
+  breakPoints?: { x: number; z: number; label: string }[];
   pois?: NavMapPoi[];
 };
 
@@ -862,7 +864,11 @@ export class Floor2DScene3d {
       }
       addZoneLabelsAndFills(plate, layer.zones, y);
       if (showObjects) addObjectBlocks(plate, layer.objects, y);
+      for (const probe of layer.debugPaths ?? []) {
+        if (probe.path.length >= 2) this.addRoutePath(probe.path, y, probe.color, ROUTE_RADIUS * 0.55, 0.65);
+      }
       this.addRoutePath(layer.path, y);
+      this.addBreakPoints(layer.breakPoints ?? [], y, plate);
 
       const floorPois =
         layer.pois ??
@@ -897,10 +903,16 @@ export class Floor2DScene3d {
     points: THREE.Vector3[],
     radius = ROUTE_RADIUS,
     parent: THREE.Object3D = this.content,
+    color: string = STYLE.route,
+    opacity = 1,
   ): void {
     if (points.length < 2) return;
     const up = new THREE.Vector3(0, 1, 0);
-    const routeMat = new THREE.MeshBasicMaterial({ color: hex(STYLE.route) });
+    const routeMat = new THREE.MeshBasicMaterial({
+      color: hex(color),
+      transparent: opacity < 1,
+      opacity,
+    });
 
     for (let i = 0; i < points.length - 1; i++) {
       const a = points[i];
@@ -921,11 +933,33 @@ export class Floor2DScene3d {
     }
   }
 
-  private addRoutePath(path: { x: number; z: number }[], floorY: number): void {
+  private addRoutePath(
+    path: { x: number; z: number }[],
+    floorY: number,
+    color = STYLE.route,
+    radius = ROUTE_RADIUS,
+    opacity = 1,
+  ): void {
     if (path.length < 2) return;
     const y = floorY + ROUTE_LIFT;
     const points = path.map((p) => new THREE.Vector3(p.x, y, p.z));
-    this.addRouteSegments(points);
+    this.addRouteSegments(points, radius, this.content, color, opacity);
+  }
+
+  private addBreakPoints(
+    points: { x: number; z: number; label: string }[],
+    floorY: number,
+    parent: THREE.Object3D,
+  ): void {
+    if (points.length === 0) return;
+    const y = floorY + ROUTE_LIFT + 0.08;
+    const mat = new THREE.MeshBasicMaterial({ color: 0xdc2626 });
+    for (const bp of points) {
+      const mesh = new THREE.Mesh(new THREE.SphereGeometry(0.22, 12, 12), mat);
+      mesh.position.set(bp.x, y, bp.z);
+      mesh.renderOrder = 14;
+      parent.add(mesh);
+    }
   }
 
   private addGapRoute(link: FloorRouteConnector, floors: FloorDisplayLayer[]): void {
@@ -940,7 +974,7 @@ export class Floor2DScene3d {
       new THREE.Vector3(link.from.x, leaveY + ROUTE_LIFT, link.from.z),
     ];
 
-    if (link.via.length >= 2) {
+    if (link.via.length >= 1) {
       for (const v of link.via) {
         const t =
           Math.abs(worldSpan) > 1e-4
@@ -949,14 +983,6 @@ export class Floor2DScene3d {
         const y = leaveY + t * (enterY - leaveY) + ROUTE_LIFT;
         points.push(new THREE.Vector3(v.x, y, v.z));
       }
-    } else {
-      points.push(
-        new THREE.Vector3(
-          (link.from.x + link.to.x) * 0.5,
-          (leaveY + enterY) * 0.5 + ROUTE_LIFT,
-          (link.from.z + link.to.z) * 0.5,
-        ),
-      );
     }
 
     points.push(new THREE.Vector3(link.to.x, enterY + ROUTE_LIFT, link.to.z));
